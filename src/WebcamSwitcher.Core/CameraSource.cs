@@ -661,6 +661,9 @@ public sealed class CameraSource : IAsyncDisposable
                 return true;
             }
 
+            if (LowBandwidthPreview)
+                return await SetLowBandwidthFormatAsync(source, formats);
+
             int wantW = captureWidth > 0 ? captureWidth : OutputWidth;
             int wantH = captureHeight > 0 ? captureHeight : OutputHeight;
             bool forced = captureWidth > 0 && captureHeight > 0;
@@ -765,6 +768,45 @@ public sealed class CameraSource : IAsyncDisposable
             AppLog.Write($"Source({DisplayName}): SetFormat failed ({ex.Message}); keeping the device's current format");
             return true;
         }
+    }
+
+    /// <summary>
+    /// For a thumbnail only (the registration screen's temporary previews of
+    /// cameras no role uses yet): ask the camera for its smallest mode at least
+    /// 320 px wide, uncompressed, at the lowest rate of 5 fps or more. Many
+    /// cameras are previewed at once on shared USB buses; a full 720p30 stream
+    /// each would exhaust the bus after two or three of them.
+    /// </summary>
+    public bool LowBandwidthPreview { get; set; }
+
+    private async Task<bool> SetLowBandwidthFormatAsync(MediaFrameSource source, IReadOnlyList<MediaFrameFormat> formats)
+    {
+        double outAspect = (double)OutputWidth / OutputHeight;
+        var pick = formats
+            .Select(f => new { Format = f, W = f.VideoFormat.Width, H = f.VideoFormat.Height, Fps = FpsOf(f), Compressed = IsCompressed(f.Subtype) })
+            .Where(c => c.H > 0)
+            .OrderBy(c => c.W >= 320 ? 0 : 1)
+            .ThenBy(c => (double)c.W * c.H)
+            .ThenBy(c => Math.Abs((double)c.W / c.H - outAspect))
+            .ThenBy(c => c.Compressed ? 1 : 0)               // no decoder for a thumbnail
+            .ThenBy(c => c.Fps >= 5 ? c.Fps : 1000 + c.Fps)  // lowest rate that still moves
+            .FirstOrDefault();
+        if (pick == null)
+            return true;
+
+        _chosenSubtype = pick.Format.Subtype ?? "NV12";
+        InputNominalFps = pick.Fps;
+        try
+        {
+            await source.SetFormatAsync(pick.Format);
+            AppLog.Write($"Source({DisplayName}): preview format -> {pick.W}x{pick.H} {_chosenSubtype}@{pick.Fps:0.#} " +
+                         $"(~{RawMbps(pick.W, pick.H, _chosenSubtype, pick.Fps):0} Mbps, low-bandwidth preview)");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write($"Source({DisplayName}): preview SetFormat failed ({ex.Message}); keeping the device's current format");
+        }
+        return true;
     }
 
     /// <summary>

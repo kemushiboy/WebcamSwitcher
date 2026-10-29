@@ -40,13 +40,21 @@ public partial class RegistrationWindow : Window
         Loaded += async (_, _) => await LoadAsync();
         Closed += async (_, _) =>
         {
+            _closed = true;
             _timer.Stop();
             await ReleaseTemporaryPreviewsAsync();
-            foreach (var r in _deviceRows)
+            foreach (var r in _deviceRows.ToList())
                 r.Unhook();
         };
         _timer.Tick += (_, _) => RefreshDeviceStatus();
     }
+
+    // Scans are serialised and a newer scan supersedes an older one: opening the
+    // previews of many cameras takes seconds, and Re-scan / Save during that
+    // time must not tear the device list out from under the running scan.
+    private readonly SemaphoreSlim _scanGate = new(1, 1);
+    private int _scanVersion;
+    private bool _closed;
 
     // ------------------------------------------------------------------ load
 
@@ -58,6 +66,33 @@ public partial class RegistrationWindow : Window
     }
 
     private async Task RescanAsync()
+    {
+        int version = Interlocked.Increment(ref _scanVersion);
+        await _scanGate.WaitAsync();
+        try
+        {
+            if (_closed || version != Volatile.Read(ref _scanVersion))
+                return; // superseded by a newer scan
+            RefreshBtn.IsEnabled = false;
+            SaveBtn.IsEnabled = false;
+            await RescanCoreAsync(version);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("Registration", $"scan failed {ex.GetType().Name}: {ex.Message}");
+            ErrorText.Text = "Camera scan failed: " + ex.Message;
+        }
+        finally
+        {
+            RefreshBtn.IsEnabled = true;
+            SaveBtn.IsEnabled = true;
+            _scanGate.Release();
+        }
+    }
+
+    private bool Superseded(int version) => _closed || version != Volatile.Read(ref _scanVersion);
+
+    private async Task RescanCoreAsync(int version)
     {
         await ReleaseTemporaryPreviewsAsync();
         foreach (var r in _deviceRows)
@@ -77,7 +112,12 @@ public partial class RegistrationWindow : Window
         }
         AppLog.Write("Registration", $"scan: {cams.Count} physical camera(s)");
 
-        var channels = _pipeline.Channels.ToDictionary(c => c.Config.DeviceId ?? "", StringComparer.OrdinalIgnoreCase);
+        // Only roles with a device can own a row; several unassigned roles must
+        // not collide on an empty key.
+        var channels = new Dictionary<string, RoleChannel>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in _pipeline.Channels)
+            if (c.Config.IsAssigned)
+                channels.TryAdd(c.Config.DeviceId!, c);
         foreach (var cam in cams)
         {
             var owner = _draft.Cameras.FirstOrDefault(c => string.Equals(c.DeviceId, cam.DeviceId, StringComparison.OrdinalIgnoreCase));
@@ -105,14 +145,20 @@ public partial class RegistrationWindow : Window
             DevicesPanel.Children.Add(new TextBlock { Text = "No physical camera found.", Foreground = Brushes.Gray });
 
         RefreshRoleChoices();
-        foreach (var row in _deviceRows)
+        foreach (var row in _deviceRows.ToList())
+        {
+            if (Superseded(version))
+                return;
             await row.StartPreviewAsync();
+            if (_closed)
+                await row.StopTemporaryPreviewAsync();
+        }
         RefreshDeviceStatus();
     }
 
     private async Task ReleaseTemporaryPreviewsAsync()
     {
-        foreach (var r in _deviceRows)
+        foreach (var r in _deviceRows.ToList())
             await r.StopTemporaryPreviewAsync();
     }
 
@@ -377,7 +423,12 @@ public partial class RegistrationWindow : Window
                 return;
             }
 
-            var src = new CameraSource(Camera.DeviceId, "preview " + Camera.FriendlyName) { PreviewEnabled = true, ScaleMode = ScaleModes.Letterbox };
+            var src = new CameraSource(Camera.DeviceId, "preview " + Camera.FriendlyName)
+            {
+                PreviewEnabled = true,
+                ScaleMode = ScaleModes.Letterbox,
+                LowBandwidthPreview = true, // many unassigned cameras are previewed at once
+            };
             src.PreviewReady += (bgra, w, h) => OnPreview(bgra);
             _status.Text = "opening a temporary preview…";
             bool ok = await src.StartAsync(640, 360);
