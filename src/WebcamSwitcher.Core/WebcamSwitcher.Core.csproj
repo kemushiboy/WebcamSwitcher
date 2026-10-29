@@ -16,5 +16,6 @@
          scalar conversion as the byte-identity oracle. Not part of the app. -->
         <InternalsVisibleTo Include="WebcamSwitcher.MfProbe" />
     <InternalsVisibleTo Include="WebcamSwitcher.VcamTest" />
+    <InternalsVisibleTo Include="WebcamSwitcher.RoleTest" />
   </ItemGroup>
 </Project>

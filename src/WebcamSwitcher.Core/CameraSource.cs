@@ -17,9 +17,28 @@ internal unsafe interface IMemoryBufferByteAccess
     void GetBuffer(out byte* buffer, out uint capacity);
 }
 
+/// <summary>Why a capture start failed. Each maps to a distinct operator-facing state.</summary>
+public enum CaptureFailure
+{
+    None,
+    /// <summary>The configured device ID is not enumerated (unplugged, other port, disabled).</summary>
+    DeviceNotFound,
+    /// <summary>The device exists but could not be opened (driver, privacy setting, generic failure).</summary>
+    OpenFailed,
+    /// <summary>Another application holds the camera exclusively.</summary>
+    InUse,
+    /// <summary>No usable capture format, or the format / reader could not be set.</summary>
+    FormatFailed,
+    /// <summary>The stream started but no frame arrived.</summary>
+    NoFrames,
+    /// <summary>Streaming could not start in a way typical of an exhausted USB controller.</summary>
+    BandwidthSuspected,
+}
+
 /// <summary>
-/// Captures a single physical camera in non-blocking share mode via
-/// MediaFrameReader and normalizes each frame to NV12 at the output size.
+/// Captures a single physical camera (by exact device ID) via MediaFrameReader
+/// and normalizes each frame to NV12 at the output size, fitting a different
+/// aspect by letterbox, crop or stretch.
 /// </summary>
 public sealed class CameraSource : IAsyncDisposable
 {
@@ -60,6 +79,26 @@ public sealed class CameraSource : IAsyncDisposable
     private volatile bool _disposed;
     private volatile bool _captureDesired; // true while capture should be running (incl. during recovery)
 
+    // --- Operator-facing stats (read by the role supervisor / UI) -------------
+    private long _droppedFrames;            // null bitmaps, conversion errors, size mismatch
+    private long _framesLifetime;           // frames across restarts
+    private long _lastFrameUtcTicks;        // DateTime.UtcNow.Ticks of the last good frame
+    private long _lastArrivalQpc;           // Stopwatch timestamp at the start of the last callback
+    private long _processTicksTotal;        // Stopwatch ticks spent converting/publishing
+    private long _processSamples;
+    private double _measuredFps;
+    private long _measureWindowStart = Environment.TickCount64;
+    private long _measureWindowFrames;
+    private volatile bool _deviceLost;
+
+    // Geometry: the reader delivers _readW x _readH; it is placed into the
+    // OutputWidth x OutputHeight canvas at (_dstX,_dstY) (letterbox) or a window
+    // starting at (_srcX,_srcY) is taken from it (crop). Equal sizes = straight copy.
+    private int _readW, _readH;
+    private int _dstX, _dstY, _srcX, _srcY;
+    private int _copyW, _copyH;
+    private bool _canvasCleared;
+
     private const long StallThresholdMs = 2000;
     private const long StartupGraceMs = 5000;
     private const long RecoveryFirstFrameTimeoutMs = 5000;
@@ -73,6 +112,62 @@ public sealed class CameraSource : IAsyncDisposable
     public string DeviceId { get; }
     public string DisplayName { get; }
     public bool Running { get; private set; }
+
+    /// <summary>Why the last start failed (None after a successful start).</summary>
+    public CaptureFailure LastFailure { get; private set; }
+
+    /// <summary>Human-readable detail for <see cref="LastFailure"/> (HRESULT, status...).</summary>
+    public string LastFailureDetail { get; private set; } = "";
+
+    /// <summary>
+    /// Set when Windows reports the device failed or went away while streaming
+    /// (MediaCapture.Failed). The supervisor then treats the camera as removed.
+    /// </summary>
+    public bool DeviceLost => _deviceLost;
+
+    /// <summary>Native capture mode actually selected (size, subtype, nominal fps).</summary>
+    public int InputWidth { get; private set; }
+    public int InputHeight { get; private set; }
+    public string InputSubtype => _chosenSubtype;
+    public double InputNominalFps { get; private set; }
+
+    /// <summary>Frames per second measured over the last ~2 s.</summary>
+    public double MeasuredFps => Volatile.Read(ref _measuredFps);
+
+    public long DroppedFrames => Interlocked.Read(ref _droppedFrames);
+    public long FramesLifetime => Interlocked.Read(ref _framesLifetime);
+
+    /// <summary>UTC time of the last delivered frame (DateTime.MinValue when none).</summary>
+    public DateTime LastFrameUtc
+    {
+        get
+        {
+            long t = Interlocked.Read(ref _lastFrameUtcTicks);
+            return t == 0 ? DateTime.MinValue : new DateTime(t, DateTimeKind.Utc);
+        }
+    }
+
+    /// <summary>Stopwatch timestamp taken when the frame now being published arrived.</summary>
+    public long LastArrivalTimestamp => Interlocked.Read(ref _lastArrivalQpc);
+
+    /// <summary>Average per-frame processing time on this source's thread, in microseconds.</summary>
+    public double AverageProcessMicros
+    {
+        get
+        {
+            long n = Interlocked.Read(ref _processSamples);
+            return n == 0 ? 0 : Interlocked.Read(ref _processTicksTotal) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency / n;
+        }
+    }
+
+    /// <summary>"Letterbox" (default), "Crop" or "Stretch"; see <see cref="ScaleModes"/>.</summary>
+    public string ScaleMode { get; set; } = ScaleModes.Letterbox;
+
+    /// <summary>Requested capture frame rate used to choose the native mode (0 = output rate).</summary>
+    public int RequestedCaptureFps { get; set; }
+
+    /// <summary>Path the frames take, for the status display (e.g. "NV12 960x720 -> letterbox").</summary>
+    public string PipelineDescription { get; private set; } = "";
 
     public int OutputWidth { get; private set; }
     public int OutputHeight { get; private set; }
@@ -153,9 +248,27 @@ public sealed class CameraSource : IAsyncDisposable
             Volatile.Write(ref _nextRecoveryTicks, 0);
 
             _captureDesired = true;
-            bool ok = await StartCoreAsync(outWidth, outHeight, captureWidth, captureHeight, groups).ConfigureAwait(false);
+            LastFailure = CaptureFailure.None;
+            LastFailureDetail = "";
+            bool ok;
+            try
+            {
+                ok = await StartCoreAsync(outWidth, outHeight, captureWidth, captureHeight, groups).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ok = false;
+                Classify(ex);
+                AppLog.Write($"Source.StartAsync({DisplayName}): {LastFailure} - {LastFailureDetail}");
+            }
             if (!ok)
+            {
                 _captureDesired = false;
+                if (LastFailure == CaptureFailure.None)
+                    Fail(CaptureFailure.OpenFailed, "start returned false");
+                // Release whatever was opened so the device is free for a retry.
+                try { await DisposeCoreAsync().ConfigureAwait(false); } catch { }
+            }
             return ok;
         }
         finally
@@ -173,8 +286,13 @@ public sealed class CameraSource : IAsyncDisposable
     {
         OutputWidth = outWidth;
         OutputHeight = outHeight;
-        _nv12 = new byte[Protocol.Nv12Size(outWidth, outHeight)];
-        _preview = new byte[PreviewWidth * PreviewHeight * 4];
+        _deviceLost = false;
+        // Reuse buffers across reconnects; only a size change reallocates.
+        if (_nv12.Length != Protocol.Nv12Size(outWidth, outHeight))
+            _nv12 = new byte[Protocol.Nv12Size(outWidth, outHeight)];
+        if (_preview.Length != PreviewWidth * PreviewHeight * 4)
+            _preview = new byte[PreviewWidth * PreviewHeight * 4];
+        SetGeometry(outWidth, outHeight, outWidth, outHeight);
         // A restart must not inherit "a frame already arrived" from the last run.
         Interlocked.Exchange(ref _framesArrived, 0);
         Interlocked.Exchange(ref _firstFrameLogged, 0);
@@ -186,10 +304,12 @@ public sealed class CameraSource : IAsyncDisposable
         // Callers may pass a pre-enumerated list so N cameras don't each perform
         // a full redundant device scan; when null, enumerate as before.
         groups ??= await MediaFrameSourceGroup.FindAllAsync();
-        var group = groups.FirstOrDefault(g => g.Id == DeviceId);
+        // Exact device-ID match only. Never fall back to another camera.
+        var group = groups.FirstOrDefault(g => string.Equals(g.Id, DeviceId, StringComparison.OrdinalIgnoreCase));
         if (group == null)
         {
-            AppLog.Write($"Source.StartAsync({DisplayName}): group NOT FOUND");
+            AppLog.Write($"Source.StartAsync({DisplayName}): device ID not enumerated ({CameraRoles.DeviceIdTail(DeviceId)})");
+            Fail(CaptureFailure.DeviceNotFound, "device ID not present");
             return false;
         }
 
@@ -211,18 +331,31 @@ public sealed class CameraSource : IAsyncDisposable
         }
 
         _capture = new MediaCapture();
+        _capture.Failed += OnCaptureFailed;
         AppLog.Write($"Source.StartAsync({DisplayName}): InitializeAsync");
-        await _capture.InitializeAsync(new MediaCaptureInitializationSettings
+        try
         {
-            SourceGroup = group,
-            SharingMode = MediaCaptureSharingMode.ExclusiveControl,
-            StreamingCaptureMode = StreamingCaptureMode.Video,
-            MemoryPreference = MediaCaptureMemoryPreference.Cpu
-        });
+            await _capture.InitializeAsync(new MediaCaptureInitializationSettings
+            {
+                SourceGroup = group,
+                SharingMode = MediaCaptureSharingMode.ExclusiveControl,
+                StreamingCaptureMode = StreamingCaptureMode.Video,
+                MemoryPreference = MediaCaptureMemoryPreference.Cpu
+            });
+        }
+        catch (Exception ex)
+        {
+            Classify(ex);
+            AppLog.Write($"Source({DisplayName}): open failed: {LastFailure} - {LastFailureDetail}");
+            return false;
+        }
 
         var colorSource = _capture.FrameSources.Values.FirstOrDefault(s => s.Info.SourceKind == MediaFrameSourceKind.Color);
         if (colorSource == null)
+        {
+            Fail(CaptureFailure.FormatFailed, "device has no color stream");
             return false;
+        }
 
         // Diagnostic: surface the native + supported formats so aspect/padding issues are visible.
         try
@@ -243,10 +376,14 @@ public sealed class CameraSource : IAsyncDisposable
         // example, defaults to 640x480 (4:3); scaling that into a 16:9 output
         // pillarboxes it. Selecting a native 16:9 mode fills the frame and lets
         // the Frame Server skip the resize entirely.
-        await TrySetCaptureFormatAsync(colorSource, captureWidth, captureHeight);
+        if (!await TrySetCaptureFormatAsync(colorSource, captureWidth, captureHeight))
+            return false;
+        ComputeGeometryFrom(colorSource);
 
         AppLog.Write($"Source.StartAsync({DisplayName}): CreateFrameReaderAsync");
         _reader = await StartReaderAsync(colorSource);
+        if (_reader == null)
+            return false;
         // Realtime = drop frames rather than queue when the handler falls behind
         // (the default, set explicitly for low latency / no backlog).
         _reader.AcquisitionMode = MediaFrameReaderAcquisitionMode.Realtime;
@@ -265,8 +402,12 @@ public sealed class CameraSource : IAsyncDisposable
             _reader.Dispose();
             _reader = null;
 
-            await TrySetCaptureFormatAsync(colorSource, captureWidth, captureHeight, forceUncompressed: true);
+            if (!await TrySetCaptureFormatAsync(colorSource, captureWidth, captureHeight, forceUncompressed: true))
+                return false;
+            ComputeGeometryFrom(colorSource);
             _reader = await StartReaderAsync(colorSource);
+            if (_reader == null)
+                return false;
             _reader.AcquisitionMode = MediaFrameReaderAcquisitionMode.Realtime;
             _reader.FrameArrived += OnFrameArrived;
         }
@@ -417,6 +558,10 @@ public sealed class CameraSource : IAsyncDisposable
             _mf = mf;
             mf = null; // ownership transferred to the source
             _chosenSubtype = "MJPG";
+            InputWidth = OutputWidth;
+            InputHeight = OutputHeight;
+            InputNominalFps = CaptureFps;
+            PipelineDescription = $"MJPG decoded by Media Foundation -> {OutputWidth}x{OutputHeight} (stretch)";
             Running = true;
             AppLog.Write($"Source.StartAsync({DisplayName}): using Media Foundation MJPEG backend {OutputWidth}x{OutputHeight}");
             if (PreferSmooth30Fps)
@@ -439,7 +584,10 @@ public sealed class CameraSource : IAsyncDisposable
     /// </summary>
     private unsafe void OnMfFrameReady(byte[] nv12)
     {
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        Interlocked.Exchange(ref _lastArrivalQpc, t0);
         Interlocked.Increment(ref _framesArrived);
+        CountGoodFrame();
         if (Interlocked.Exchange(ref _firstFrameLogged, 1) == 0)
             AppLog.Write($"Source({DisplayName}): first frame {OutputWidth}x{OutputHeight} NV12 (MF-MJPEG)");
 
@@ -469,6 +617,7 @@ public sealed class CameraSource : IAsyncDisposable
 
         if (previews)
             PreviewReady?.Invoke(preview, PreviewWidth, PreviewHeight);
+        AddProcessTime(t0);
     }
 
     /// <summary>
@@ -478,22 +627,33 @@ public sealed class CameraSource : IAsyncDisposable
     /// bandwidth-limited cameras (the C920 over USB 2.0, for example) only reach
     /// their full rate in MJPG, so a compressed stream is used when it is faster.
     /// </summary>
-    private async Task TrySetCaptureFormatAsync(MediaFrameSource source, int captureWidth, int captureHeight, bool forceUncompressed = false)
+    private async Task<bool> TrySetCaptureFormatAsync(MediaFrameSource source, int captureWidth, int captureHeight, bool forceUncompressed = false)
     {
         try
         {
             var formats = source.SupportedFormats;
             if (formats == null || formats.Count == 0)
-                return;
+            {
+                // Nothing to choose from: keep the device default.
+                AppLog.Write($"Source({DisplayName}): no supported formats reported; using the device default");
+                return true;
+            }
 
             int wantW = captureWidth > 0 ? captureWidth : OutputWidth;
             int wantH = captureHeight > 0 ? captureHeight : OutputHeight;
             bool forced = captureWidth > 0 && captureHeight > 0;
             double targetAspect = (double)wantW / wantH;
             double targetArea = (double)wantW * wantH;
+            double wantFps = RequestedCaptureFps > 0 ? RequestedCaptureFps : CaptureFps;
+            string preferPick = forceUncompressed ? "Nv12" : (PreferredFormat ?? "Auto");
+            bool mjpgOnly = preferPick.Equals("Mjpg", StringComparison.OrdinalIgnoreCase);
+            bool rawOnly = preferPick.Equals("Nv12", StringComparison.OrdinalIgnoreCase);
 
-            // 1. Pick the size: exact when forced, otherwise best-matching aspect then
-            //    closest area, so 16:9 stays 16:9 and nothing gets pillarboxed.
+            // 1. Pick the size: exact when forced. Otherwise sizes that reach the
+            //    wanted frame rate (in an allowed subtype) come first - a USB 2.0
+            //    camera without MJPEG typically offers 1280x720 only at 5-10 fps,
+            //    and a 30 fps 640x480 letterboxed into 720p is the better feed -
+            //    then best-matching aspect, then closest area.
             var size = formats
                 .GroupBy(f => (W: f.VideoFormat.Width, H: f.VideoFormat.Height))
                 .Select(g => new
@@ -502,17 +662,24 @@ public sealed class CameraSource : IAsyncDisposable
                     g.Key.H,
                     Area = (double)g.Key.W * g.Key.H,
                     AspectErr = Math.Abs((double)g.Key.W / g.Key.H - targetAspect),
+                    ReachesRate = g.Any(f => FpsOf(f) >= wantFps * 0.95 &&
+                                             (!mjpgOnly || IsCompressed(f.Subtype)) &&
+                                             (!rawOnly || !IsCompressed(f.Subtype))),
                     Rates = g.ToList()
                 })
-                .OrderBy(s => forced
+                .OrderBy(s => forced ? 0 : (s.ReachesRate ? 0 : 1))
+                .ThenBy(s => forced
                     ? (Math.Abs(s.Area - targetArea), s.AspectErr)
                     : (s.AspectErr, Math.Abs(s.Area - targetArea)))
                 .First();
 
             // 2. Pick the subtype + rate at that size.
+            // Never above what was asked for when the asked rate exists: a 60 fps
+            // mode would only be thrown away by the 30 fps virtual camera.
             var candidates = size.Rates
                 .Select(f => new { Format = f, Fps = FpsOf(f), Compressed = IsCompressed(f.Subtype) })
-                .OrderByDescending(c => c.Fps)
+                .OrderBy(c => c.Fps >= wantFps * 0.95 && c.Fps <= wantFps * 1.05 ? 0 : 1)
+                .ThenByDescending(c => c.Fps)
                 .ToList();
 
             var rawBest = candidates.FirstOrDefault(c => !c.Compressed);
@@ -532,23 +699,31 @@ public sealed class CameraSource : IAsyncDisposable
             AppLog.Write($"Source({DisplayName}): {size.W}x{size.H} rates [{rates}] -> {chosen.Format.Subtype}@{chosen.Fps:0.#} (prefer {prefer})");
 
             _chosenSubtype = chosen.Format.Subtype ?? "NV12";
+            InputNominalFps = chosen.Fps;
 
             var cur = source.CurrentFormat;
             if (cur != null &&
                 cur.VideoFormat.Width == chosen.Format.VideoFormat.Width &&
                 cur.VideoFormat.Height == chosen.Format.VideoFormat.Height &&
-                string.Equals(cur.Subtype, _chosenSubtype, StringComparison.OrdinalIgnoreCase))
+                string.Equals(cur.Subtype, _chosenSubtype, StringComparison.OrdinalIgnoreCase) &&
+                Math.Abs(FpsOf(cur) - chosen.Fps) < 0.5)
             {
-                AppLog.Write($"Source({DisplayName}): capture format already {size.W}x{size.H} {_chosenSubtype}");
-                return;
+                AppLog.Write($"Source({DisplayName}): capture format already {size.W}x{size.H} {_chosenSubtype}@{chosen.Fps:0.#}");
+                return true;
             }
 
             await source.SetFormatAsync(chosen.Format);
-            AppLog.Write($"Source({DisplayName}): capture format -> {size.W}x{size.H} {_chosenSubtype}@{chosen.Fps:0.#} (target {wantW}x{wantH}{(forced ? ", forced" : "")})");
+            AppLog.Write($"Source({DisplayName}): capture format -> {size.W}x{size.H} {_chosenSubtype}@{chosen.Fps:0.#} (target {wantW}x{wantH}@{wantFps:0.#}{(forced ? ", forced" : "")})");
+            if (!chosen.Compressed && chosen.Fps < wantFps * 0.95)
+                AppLog.Write($"Source({DisplayName}): NOTE uncompressed {size.W}x{size.H} only reaches {chosen.Fps:0.#} fps on this camera (USB 2.0 bandwidth limit of the device mode)");
+            return true;
         }
         catch (Exception ex)
         {
-            AppLog.Write($"Source({DisplayName}): SetFormat failed ({ex.Message}); keeping default");
+            // A device that rejects the chosen mode keeps its current one; that is
+            // still a working camera, so only log it.
+            AppLog.Write($"Source({DisplayName}): SetFormat failed ({ex.Message}); keeping the device's current format");
+            return true;
         }
     }
 
@@ -571,7 +746,7 @@ public sealed class CameraSource : IAsyncDisposable
     /// <see cref="VideoMediaFrame.SoftwareBitmap"/> is non-null for cameras whose
     /// native format is compressed (MJPG/H.264).
     /// </summary>
-    private async Task<MediaFrameReader> StartReaderAsync(MediaFrameSource colorSource)
+    private async Task<MediaFrameReader?> StartReaderAsync(MediaFrameSource colorSource)
     {
         // Uncompressed sources are requested as NV12 at the exact output size, so the
         // Frame Server does any resize + color conversion itself and the hot path is a
@@ -579,25 +754,225 @@ public sealed class CameraSource : IAsyncDisposable
         // reader can hand back decoded NV12, and NV12 is the one subtype that works
         // for both. Bgra8 is only a fallback, because on a compressed stream it is the
         // path that yields no frames at all.
+        MediaFrameReaderStartStatus status = MediaFrameReaderStartStatus.UnknownFailure;
         try
         {
             var r = await _capture!.CreateFrameReaderAsync(
                 colorSource, MediaEncodingSubtypes.Nv12,
-                new BitmapSize { Width = (uint)OutputWidth, Height = (uint)OutputHeight });
-            await r.StartAsync();
-            AppLog.Write($"Source({DisplayName}): frame reader = Nv12 {OutputWidth}x{OutputHeight}" +
-                         (IsCompressed(_chosenSubtype) ? $" (decoding {_chosenSubtype})" : ""));
-            return r;
+                new BitmapSize { Width = (uint)_readW, Height = (uint)_readH });
+            status = await r.StartAsync();
+            if (status == MediaFrameReaderStartStatus.Success)
+            {
+                AppLog.Write($"Source({DisplayName}): frame reader = Nv12 {_readW}x{_readH} -> {PipelineDescription}" +
+                             (IsCompressed(_chosenSubtype) ? $" (decoding {_chosenSubtype})" : ""));
+                return r;
+            }
+            AppLog.Write($"Source({DisplayName}): Nv12 reader start status {status}");
+            r.Dispose();
+            if (status != MediaFrameReaderStartStatus.OutputFormatNotSupported)
+            {
+                FailFromReaderStatus(status);
+                return null;
+            }
         }
         catch (Exception ex)
         {
             AppLog.Write($"Source({DisplayName}): Nv12 reader failed ({ex.Message}); falling back to Bgra8");
         }
 
-        var bgra = await _capture!.CreateFrameReaderAsync(colorSource, MediaEncodingSubtypes.Bgra8);
-        await bgra.StartAsync();
-        AppLog.Write($"Source({DisplayName}): frame reader = Bgra8");
-        return bgra;
+        try
+        {
+            var bgra = await _capture!.CreateFrameReaderAsync(colorSource, MediaEncodingSubtypes.Bgra8);
+            status = await bgra.StartAsync();
+            if (status != MediaFrameReaderStartStatus.Success)
+            {
+                bgra.Dispose();
+                FailFromReaderStatus(status);
+                return null;
+            }
+            PipelineDescription = $"Bgra8 -> software NV12 {OutputWidth}x{OutputHeight}";
+            AppLog.Write($"Source({DisplayName}): frame reader = Bgra8");
+            return bgra;
+        }
+        catch (Exception ex)
+        {
+            Classify(ex);
+            if (LastFailure == CaptureFailure.OpenFailed)
+                Fail(CaptureFailure.FormatFailed, $"frame reader: {LastFailureDetail}");
+            return null;
+        }
+    }
+
+    private void FailFromReaderStatus(MediaFrameReaderStartStatus status)
+    {
+        switch (status)
+        {
+            case MediaFrameReaderStartStatus.ExclusiveControlNotAvailable:
+                Fail(CaptureFailure.InUse, "exclusive control not available (another app is using the camera)");
+                break;
+            case MediaFrameReaderStartStatus.OutputFormatNotSupported:
+                Fail(CaptureFailure.FormatFailed, "output format not supported by the frame reader");
+                break;
+            case MediaFrameReaderStartStatus.DeviceNotAvailable:
+                // The device enumerates and opened, yet cannot stream: on a USB
+                // bus that already carries other cameras this is the classic
+                // "not enough bandwidth / controller resources" symptom.
+                Fail(CaptureFailure.BandwidthSuspected, "device not available for streaming (USB bandwidth or controller resources suspected)");
+                break;
+            default:
+                Fail(CaptureFailure.OpenFailed, $"frame reader start status {status}");
+                break;
+        }
+    }
+
+    private void Fail(CaptureFailure failure, string detail)
+    {
+        LastFailure = failure;
+        LastFailureDetail = detail;
+    }
+
+    /// <summary>Maps an exception from opening/streaming to a failure kind.</summary>
+    private void Classify(Exception ex)
+    {
+        uint hr = unchecked((uint)ex.HResult);
+        string detail = $"0x{hr:X8} {ex.Message.Trim()}";
+        switch (hr)
+        {
+            case 0x80070005: // E_ACCESSDENIED: Windows camera privacy setting, or held by another app
+                Fail(CaptureFailure.OpenFailed, $"access denied (camera privacy setting, or in use): {detail}");
+                break;
+            case 0xC00DABE1: // MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED
+                Fail(CaptureFailure.InUse, $"camera preempted by another application: {detail}");
+                break;
+            case 0xC00DABE0: // MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED (removed while in use)
+            case 0x80070490: // ERROR_NOT_FOUND
+            case 0x8007048F: // ERROR_DEVICE_NOT_CONNECTED
+            case 0x80070015: // ERROR_NOT_READY
+                Fail(CaptureFailure.DeviceNotFound, $"device removed or not ready: {detail}");
+                break;
+            case 0xC00D3704: // MF_E_HW_MFT_FAILED_START_STREAMING: lack of hardware resources
+            case 0x8007001F: // ERROR_GEN_FAILURE from the camera driver on stream start
+            case 0x800705AA: // ERROR_NO_SYSTEM_RESOURCES
+                Fail(CaptureFailure.BandwidthSuspected, $"streaming resources unavailable (USB bandwidth suspected): {detail}");
+                break;
+            case 0xC00D36B4: // MF_E_INVALIDMEDIATYPE
+                Fail(CaptureFailure.FormatFailed, $"format negotiation failed: {detail}");
+                break;
+            default:
+                Fail(CaptureFailure.OpenFailed, detail);
+                break;
+        }
+    }
+
+    private void OnCaptureFailed(MediaCapture sender, MediaCaptureFailedEventArgs args)
+    {
+        _deviceLost = true;
+        AppLog.Write($"Source({DisplayName}): MediaCapture.Failed 0x{args.Code:X8} {args.Message?.Trim()} -> treating the device as lost");
+    }
+
+    // --- Geometry ---------------------------------------------------------------
+
+    private void SetGeometry(int readW, int readH, int outW, int outH)
+    {
+        _readW = readW;
+        _readH = readH;
+        _copyW = Math.Min(readW, outW);
+        _copyH = Math.Min(readH, outH);
+        _dstX = ((outW - _copyW) / 2) & ~1;
+        _dstY = ((outH - _copyH) / 2) & ~1;
+        _srcX = ((readW - _copyW) / 2) & ~1;
+        _srcY = ((readH - _copyH) / 2) & ~1;
+        _canvasCleared = false;
+    }
+
+    /// <summary>
+    /// Decides the reader size from the selected native mode. The reader (Media
+    /// Foundation's video processor) does the scaling, so this costs no CPU here:
+    /// letterbox asks for the largest size that fits inside the output keeping the
+    /// camera's aspect, crop asks for the smallest that covers it, stretch asks for
+    /// the output size. A native mode equal to the output is passed through.
+    /// </summary>
+    private void ComputeGeometryFrom(MediaFrameSource colorSource)
+    {
+        var vf = colorSource.CurrentFormat?.VideoFormat;
+        int sw = (int)(vf?.Width ?? 0), sh = (int)(vf?.Height ?? 0);
+        InputWidth = sw;
+        InputHeight = sh;
+        if (InputNominalFps <= 0 && colorSource.CurrentFormat != null)
+            InputNominalFps = FpsOf(colorSource.CurrentFormat);
+
+        int ow = OutputWidth, oh = OutputHeight;
+        string mode = ScaleModes.Normalize(ScaleMode);
+        if (sw <= 0 || sh <= 0 || (sw == ow && sh == oh) || mode == ScaleModes.Stretch ||
+            Math.Abs((double)sw / sh - (double)ow / oh) < 0.01)
+        {
+            SetGeometry(ow, oh, ow, oh);
+            PipelineDescription = sw == ow && sh == oh
+                ? $"{_chosenSubtype} {sw}x{sh} passthrough"
+                : $"{_chosenSubtype} {sw}x{sh} -> {ow}x{oh} ({(mode == ScaleModes.Stretch ? "stretch" : "same aspect")})";
+            return;
+        }
+
+        var (rw, rh) = FitSize(sw, sh, ow, oh, mode);
+        SetGeometry(rw, rh, ow, oh);
+        PipelineDescription = $"{_chosenSubtype} {sw}x{sh} -> {rw}x{rh} {(mode == ScaleModes.Crop ? "crop" : "letterbox")} into {ow}x{oh}";
+    }
+
+    /// <summary>
+    /// Reader size for a <paramref name="sw"/>x<paramref name="sh"/> camera in an
+    /// <paramref name="ow"/>x<paramref name="oh"/> output: letterbox = largest even
+    /// size inside the output with the camera's aspect (640x480 -> 960x720 in
+    /// 1280x720); crop = smallest covering it (640x480 -> 1280x960); stretch = output.
+    /// </summary>
+    public static (int W, int H) FitSize(int sw, int sh, int ow, int oh, string mode)
+    {
+        mode = ScaleModes.Normalize(mode);
+        if (sw <= 0 || sh <= 0 || mode == ScaleModes.Stretch)
+            return (ow, oh);
+        double scale = mode == ScaleModes.Crop
+            ? Math.Max((double)ow / sw, (double)oh / sh)
+            : Math.Min((double)ow / sw, (double)oh / sh);
+        int rw = Math.Max(2, (int)Math.Round(sw * scale) & ~1);
+        int rh = Math.Max(2, (int)Math.Round(sh * scale) & ~1);
+        return mode == ScaleModes.Crop
+            ? (Math.Max(rw, ow), Math.Max(rh, oh))
+            : (Math.Min(rw, ow), Math.Min(rh, oh));
+    }
+
+    private void CountGoodFrame()
+    {
+        Interlocked.Increment(ref _framesLifetime);
+        Interlocked.Exchange(ref _lastFrameUtcTicks, DateTime.UtcNow.Ticks);
+        long n = Interlocked.Increment(ref _measureWindowFrames);
+        long now = Environment.TickCount64;
+        long start = Interlocked.Read(ref _measureWindowStart);
+        long el = now - start;
+        if (el >= 2000 && Interlocked.CompareExchange(ref _measureWindowStart, now, start) == start)
+        {
+            Volatile.Write(ref _measuredFps, n * 1000.0 / el);
+            Interlocked.Exchange(ref _measureWindowFrames, 0);
+        }
+    }
+
+    private void AddProcessTime(long startTimestamp)
+    {
+        long dt = System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp;
+        // Rolling sum over a bounded window so the average follows the load.
+        if (Interlocked.Increment(ref _processSamples) > 300)
+        {
+            Interlocked.Exchange(ref _processSamples, 1);
+            Interlocked.Exchange(ref _processTicksTotal, dt);
+            return;
+        }
+        Interlocked.Add(ref _processTicksTotal, dt);
+    }
+
+    /// <summary>Measured fps reads 0 once frames stop, instead of the last window.</summary>
+    public void RefreshMeasuredFps()
+    {
+        long el = Environment.TickCount64 - Interlocked.Read(ref _measureWindowStart);
+        if (el > 3000)
+            Volatile.Write(ref _measuredFps, Interlocked.Read(ref _measureWindowFrames) * 1000.0 / el);
     }
 
     private async Task<bool> WaitForFirstFrameAsync(TimeSpan timeout)
@@ -727,7 +1102,8 @@ public sealed class CameraSource : IAsyncDisposable
                 bool ok;
                 try
                 {
-                    ok = await StartCoreAsync(OutputWidth, OutputHeight, _lastCaptureWidth, _lastCaptureHeight, _lastGroups)
+                    // Fresh enumeration: a re-plugged device is a new group object.
+                    ok = await StartCoreAsync(OutputWidth, OutputHeight, _lastCaptureWidth, _lastCaptureHeight, null)
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -799,6 +1175,8 @@ public sealed class CameraSource : IAsyncDisposable
 
     private void OnFrameArrived(MediaFrameReader sender, MediaFrameArrivedEventArgs args)
     {
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        Interlocked.Exchange(ref _lastArrivalQpc, t0);
         // Liveness for the stall watchdog: no allocation, no logging on the hot path.
         Interlocked.Increment(ref _framesTotal);
         Volatile.Write(ref _lastFrameTicks, Environment.TickCount64);
@@ -815,6 +1193,7 @@ public sealed class CameraSource : IAsyncDisposable
         using var sw = frame?.VideoMediaFrame?.SoftwareBitmap;
         if (sw == null)
         {
+            Interlocked.Increment(ref _droppedFrames);
             if ((Interlocked.Increment(ref _nullFrames) & 0x3F) == 1)
                 AppLog.Write($"Source({DisplayName}): null SoftwareBitmap x{_nullFrames}");
             return;
@@ -839,9 +1218,11 @@ public sealed class CameraSource : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            Interlocked.Increment(ref _droppedFrames);
             if (Interlocked.Increment(ref _convertErrors) <= 5)
                 AppLog.Write($"Source({DisplayName}): ConvertToNv12 EX #{_convertErrors} {ex.GetType().Name}: {ex.Message}");
         }
+        AddProcessTime(t0);
     }
 
     private unsafe void ConvertToNv12(SoftwareBitmap sw)
@@ -877,7 +1258,27 @@ public sealed class CameraSource : IAsyncDisposable
             if (w == OutputWidth && h == OutputHeight)
             {
                 CopyNv12Tight(src, w, h, stride, nv12);
+                CountGoodFrame();
                 FrameReady?.Invoke(nv12);
+            }
+            else if (w == _readW && h == _readH)
+            {
+                // Letterbox / crop: one row-wise copy of the visible window into
+                // the reused canvas. The bars are painted once, not per frame.
+                if (!_canvasCleared)
+                {
+                    FillBlack(nv12, OutputWidth, OutputHeight);
+                    _canvasCleared = true;
+                }
+                CopyNv12Window(src, stride, h, nv12, OutputWidth, OutputHeight);
+                CountGoodFrame();
+                FrameReady?.Invoke(nv12);
+            }
+            else
+            {
+                // Should not happen (the reader was asked for this size).
+                if ((Interlocked.Increment(ref _droppedFrames) & 0x3F) == 1)
+                    AppLog.Write($"Source({DisplayName}): unexpected frame size {w}x{h} (expected {_readW}x{_readH}); frame dropped");
             }
             if (previews)
                 ColorConverter.Nv12ToBgra8Downscale(src, w, h, stride, preview, PreviewWidth, PreviewHeight);
@@ -886,6 +1287,7 @@ public sealed class CameraSource : IAsyncDisposable
         {
             // Fallback: reader delivered Bgra8 (rare). Legacy conversion path.
             ColorConverter.Bgra8ToNv12(src, w, h, stride, nv12, OutputWidth, OutputHeight);
+            CountGoodFrame();
             FrameReady?.Invoke(nv12);
             if (previews)
                 ColorConverter.Bgra8Downscale(src, w, h, stride, preview, PreviewWidth, PreviewHeight);
@@ -893,6 +1295,33 @@ public sealed class CameraSource : IAsyncDisposable
 
         if (previews)
             PreviewReady?.Invoke(preview, PreviewWidth, PreviewHeight);
+    }
+
+    /// <summary>Black NV12 (Y=16, UV=128: video range).</summary>
+    internal static void FillBlack(byte[] nv12, int w, int h)
+    {
+        int y = w * h;
+        Array.Fill(nv12, (byte)16, 0, y);
+        Array.Fill(nv12, (byte)128, y, Math.Min(nv12.Length - y, w * h / 2));
+    }
+
+    /// <summary>
+    /// Copies the visible window of a <c>_readW x srcH</c> NV12 frame into the
+    /// output canvas (letterbox: whole frame at an offset; crop: the centre).
+    /// </summary>
+    private unsafe void CopyNv12Window(byte* src, int srcStride, int srcH, byte[] dst, int outW, int outH)
+    {
+        int cw = _copyW, ch = _copyH;
+        fixed (byte* d = dst)
+        {
+            for (int y = 0; y < ch; y++)
+                Buffer.MemoryCopy(src + (_srcY + y) * srcStride + _srcX, d + (_dstY + y) * outW + _dstX, cw, cw);
+
+            byte* suv = src + srcStride * srcH;
+            byte* duv = d + outW * outH;
+            for (int y = 0; y < ch / 2; y++)
+                Buffer.MemoryCopy(suv + (_srcY / 2 + y) * srcStride + _srcX, duv + (_dstY / 2 + y) * outW + _dstX, cw, cw);
+        }
     }
 
     private static unsafe void CopyNv12Tight(byte* src, int w, int h, int srcStride, byte[] dst)
@@ -965,7 +1394,8 @@ public sealed class CameraSource : IAsyncDisposable
         if (_capture != null)
         {
             AppLog.Write($"Source.Dispose({DisplayName}): MediaCapture.Dispose");
-            _capture.Dispose();
+            try { _capture.Failed -= OnCaptureFailed; } catch { }
+            try { _capture.Dispose(); } catch (Exception ex) { AppLog.Write($"Source.Dispose({DisplayName}): MediaCapture.Dispose threw {ex.Message}"); }
             _capture = null;
         }
         Running = false;

@@ -1,46 +1,166 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 namespace WebcamSwitcher.Core;
 
+/// <summary>
+/// One Camera Role: a fixed, named virtual camera (e.g. <c>CAM-01</c>) bound to
+/// exactly one physical camera by its Windows device ID.
+///
+/// The role, not the position in <see cref="AppConfig.Cameras"/>, is the
+/// identity: the virtual camera name, its pipe and its persistent ID all derive
+/// from the role, so reordering the list or a different device enumeration
+/// order can never swap two feeds.
+/// </summary>
 public class CameraConfig
 {
-    public string? DeviceId { get; set; }
-    public string FriendlyName { get; set; } = "";
+    /// <summary>Camera Role, e.g. <c>CAM-01</c>. Unique across the config.</summary>
+    public string Role { get; set; } = "";
 
     /// <summary>
-    /// Optional per-camera capture size. When null, the closest supported format
-    /// whose aspect matches the global output is chosen automatically (which keeps
-    /// e.g. a 4:3 webcam from being pillarboxed into a 16:9 canvas).
+    /// Friendly name the virtual camera is registered with (default: the role).
+    /// Windows may append " (Windows Virtual Camera)" when listing it. Unique.
+    /// </summary>
+    public string VirtualCameraName { get; set; } = "";
+
+    /// <summary>
+    /// Persistent identifier of this role's virtual camera (a GUID, "N" format).
+    /// Generated once and never reused by another role; the role's frame pipe
+    /// is named after it, so it survives renames of the role display text.
+    /// </summary>
+    public string VirtualCameraId { get; set; } = "";
+
+    /// <summary>
+    /// Windows device interface ID (symbolic link) of the physical camera,
+    /// e.g. <c>\\?\USB#VID_...#6&amp;...&amp;0&amp;0000#{e5323777-...}\GLOBAL</c>.
+    /// Null/empty means the role is not assigned. Never matched by name or
+    /// position: a missing ID is reported as MISSING, never replaced.
+    /// </summary>
+    public string? DeviceId { get; set; }
+
+    /// <summary>Friendly name the device reported when it was registered (display only).</summary>
+    public string PhysicalFriendlyName { get; set; } = "";
+
+    /// <summary>
+    /// Legacy (schema 1) name of the physical camera. Read for migration into
+    /// <see cref="PhysicalFriendlyName"/> and never written again.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? FriendlyName { get; set; }
+
+    /// <summary>
+    /// Optional capture size. Null = Auto: the supported size that best matches
+    /// the output aspect, then area.
     /// </summary>
     public int? CaptureWidth { get; set; }
     public int? CaptureHeight { get; set; }
 
     /// <summary>
-    /// Optional capture-format preference: "Auto" (default), "Nv12" or "Mjpg".
-    /// Auto keeps the uncompressed stream when it already runs at full rate and
-    /// otherwise switches to MJPG, which is the only way a USB 2.0 camera reaches
-    /// 30 fps at 720p/1080p.
+    /// Optional capture frame rate request. Null = the output frame rate. The
+    /// physical camera still delivers whatever it can; this only steers which
+    /// native mode is picked.
+    /// </summary>
+    public int? CaptureFps { get; set; }
+
+    /// <summary>
+    /// Capture-format preference: "Auto" (default), "Nv12" or "Mjpg". Auto keeps
+    /// the uncompressed stream when it already runs at full rate and never
+    /// assumes the camera offers MJPEG.
     /// </summary>
     public string CaptureFormat { get; set; } = "Auto";
 
     /// <summary>
-    /// Whether this camera's passthrough virtual camera is created at launch and
-    /// by the global virtual-camera toggle. Defaults to true; turning it off
-    /// stops exactly this slot and leaves the others running. The friendly name
-    /// and pipe of every slot are computed regardless, so this slot can be
-    /// started later without a restart and never renames its neighbours.
+    /// How a capture whose aspect differs from the output is fitted:
+    /// "Letterbox" (default, keeps the whole picture), "Crop" (fills the frame)
+    /// or "Stretch".
     /// </summary>
+    public string ScaleMode { get; set; } = ScaleModes.Letterbox;
+
+    /// <summary>Whether this role's virtual camera is registered. Default true.</summary>
     public bool VirtualCameraEnabled { get; set; } = true;
 
-    /// <summary>
-    /// Extra video delay for this camera, in milliseconds (default 0, i.e. no
-    /// delay at all). Added to <see cref="AppConfig.CommonDelayMs"/> before it is
-    /// converted to frames, so a camera that is consistently ahead of the others
-    /// can be lined up with them. 0 costs nothing: the delay stage is bypassed.
-    /// </summary>
+    /// <summary>Extra video delay for this role in ms (0 = delay stage bypassed).</summary>
     public int DelayMs { get; set; }
+
+    /// <summary>Unknown properties from a newer/other version, kept on save.</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extra { get; set; }
+
+    /// <summary>Display name of the physical camera, whichever schema it came from.</summary>
+    [JsonIgnore]
+    public string DisplayDeviceName =>
+        !string.IsNullOrWhiteSpace(PhysicalFriendlyName) ? PhysicalFriendlyName : FriendlyName ?? "";
+
+    [JsonIgnore]
+    public bool IsAssigned => !string.IsNullOrWhiteSpace(DeviceId);
+
+    public CameraConfig Clone()
+    {
+        var c = (CameraConfig)MemberwiseClone();
+        c.Extra = Extra == null ? null : new Dictionary<string, JsonElement>(Extra);
+        return c;
+    }
+}
+
+public static class ScaleModes
+{
+    public const string Letterbox = "Letterbox";
+    public const string Crop = "Crop";
+    public const string Stretch = "Stretch";
+
+    public static readonly string[] All = { Letterbox, Crop, Stretch };
+
+    public static string Normalize(string? value)
+    {
+        foreach (var m in All)
+            if (string.Equals(m, value?.Trim(), StringComparison.OrdinalIgnoreCase))
+                return m;
+        return Letterbox;
+    }
+}
+
+/// <summary>Reconnect policy for a physical camera that disappeared or failed to open.</summary>
+public class ReconnectConfig
+{
+    /// <summary>Delay between reconnect attempts, ms.</summary>
+    public int RetryIntervalMs { get; set; } = 2000;
+
+    /// <summary>Attempts before giving up (ignored when <see cref="RetryForever"/>).</summary>
+    public int RetryCount { get; set; } = 30;
+
+    /// <summary>Keep retrying for as long as the app runs. Default true (exhibition use).</summary>
+    public bool RetryForever { get; set; } = true;
+
+    /// <summary>
+    /// At launch, wait up to this long for every assigned device to enumerate
+    /// before opening cameras (USB devices can appear late after a cold boot).
+    /// The virtual cameras are registered immediately and show a diagnostic
+    /// picture meanwhile.
+    /// </summary>
+    public int StartupWaitMs { get; set; } = 15000;
+
+    /// <summary>No frame for this long marks a connected camera NO SIGNAL.</summary>
+    public int NoSignalTimeoutMs { get; set; } = 2000;
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extra { get; set; }
+
+    public void Normalize()
+    {
+        RetryIntervalMs = Math.Clamp(RetryIntervalMs, 250, 600_000);
+        RetryCount = Math.Clamp(RetryCount, 0, 1_000_000);
+        StartupWaitMs = Math.Clamp(StartupWaitMs, 0, 600_000);
+        NoSignalTimeoutMs = Math.Clamp(NoSignalTimeoutMs, 500, 60_000);
+    }
 }
 
 public class AppConfig
 {
+    /// <summary>Current configuration schema. 1 = original WebcamSwitcher (no field).</summary>
+    public const int CurrentSchemaVersion = 2;
+
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+
     public int Width { get; set; } = Protocol.DefaultWidth;
     public int Height { get; set; } = Protocol.DefaultHeight;
     public int Fps { get; set; } = Protocol.DefaultFps;
@@ -53,62 +173,85 @@ public class AppConfig
     public bool StartWithWindows { get; set; }
     public bool StartMinimized { get; set; }
 
-    /// <summary>
-    /// Legacy master switch, kept for config compatibility only. Virtual cameras
-    /// now start from the per-slot flags (<see cref="SwitcherVirtualCameraEnabled"/>
-    /// and <see cref="CameraConfig.VirtualCameraEnabled"/>), so this value is no
-    /// longer consulted anywhere.
-    /// </summary>
+    /// <summary>Legacy master switch, kept so older files load. Not consulted.</summary>
     public bool VirtualCameraOnLaunch { get; set; }
 
     /// <summary>
     /// Whether the switcher virtual camera ("WebcamSwitcher Virtual Camera") is
-    /// created at launch and by the global toggle. Defaults to true and is
-    /// independent of the per-camera <see cref="CameraConfig.VirtualCameraEnabled"/>.
+    /// created. Default false: this build is centred on the per-role cameras.
     /// </summary>
-    public bool SwitcherVirtualCameraEnabled { get; set; } = true;
+    public bool SwitcherVirtualCameraEnabled { get; set; }
 
-    /// <summary>
-    /// Whether live camera thumbnails are rendered. Turning this off skips the
-    /// per-frame preview scaling (a measurable CPU saving) while capture and the
-    /// passthrough virtual cameras keep running.
-    /// </summary>
+    /// <summary>Whether live camera thumbnails are rendered (capture is unaffected).</summary>
     public bool PreviewsEnabled { get; set; } = true;
 
-    /// <summary>
-    /// Whether the cameras are capturing. Persisted so quitting with capture off
-    /// does not silently start the cameras again on the next launch.
-    /// </summary>
+    /// <summary>Whether cameras are captured at launch ("auto-start capture").</summary>
     public bool CaptureEnabled { get; set; } = true;
 
     /// <summary>
-    /// When on, each camera's exposure is pinned to manual 1/30 s so a dim scene
-    /// cannot make the camera lengthen integration time and drop to 15 fps. The
-    /// image may be darker in low light; that is the accepted tradeoff.
+    /// Register the enabled role virtual cameras at launch. Default true. When
+    /// false nothing is registered until the user switches a camera on.
     /// </summary>
-    public bool PreferSmooth30Fps { get; set; }
+    public bool AutoRegisterVirtualCameras { get; set; } = true;
 
     /// <summary>
-    /// Video delay applied to every camera, in milliseconds (default 0, i.e. no
-    /// delay at all). Each camera adds its own <see cref="CameraConfig.DelayMs"/>
-    /// to this, so the common value sets the baseline latency and the per-camera
-    /// value lines up the odd camera out. 0 bypasses the delay stage entirely.
+    /// Ask Windows to relaunch the app after a crash or hang
+    /// (RegisterApplicationRestart; only after it has run for 60 s).
     /// </summary>
+    public bool RestartOnCrash { get; set; } = true;
+
+    public bool PreferSmooth30Fps { get; set; }
+
     public int CommonDelayMs { get; set; }
 
-    /// <summary>Largest accepted delay; 2 s is far more than A/V sync needs.</summary>
+    public ReconnectConfig Reconnect { get; set; } = new();
+
+    /// <summary>Seconds between performance log lines (CPU, memory, per-role fps). 0 = off.</summary>
+    public int PerformanceLogIntervalSeconds { get; set; } = 60;
+
+    /// <summary>Rotated log files kept (each up to <see cref="LogMaxFileMB"/>).</summary>
+    public int LogMaxFiles { get; set; } = 10;
+    public int LogMaxFileMB { get; set; } = 5;
+
+    /// <summary>Unknown top-level properties, kept on save.</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extra { get; set; }
+
     public const int MaxDelayMs = 2000;
 
-    /// <summary>Clamps/repairs values so they are always valid before use.</summary>
+    /// <summary>
+    /// Clamps/repairs values so they are always valid before use. Never renames,
+    /// reorders or reassigns roles: duplicates are reported by
+    /// <see cref="CameraRoles.Validate"/> instead of being silently "fixed".
+    /// </summary>
     public void Normalize()
     {
         Width = ClampEven(Width, Protocol.DefaultWidth);
         Height = ClampEven(Height, Protocol.DefaultHeight);
         Fps = Math.Clamp(Fps, 1, 60);
 
+        Cameras ??= new();
+        Reconnect ??= new();
+        Reconnect.Normalize();
+        PerformanceLogIntervalSeconds = Math.Clamp(PerformanceLogIntervalSeconds, 0, 3600);
+        LogMaxFiles = Math.Clamp(LogMaxFiles, 1, 100);
+        LogMaxFileMB = Math.Clamp(LogMaxFileMB, 1, 100);
+
         CommonDelayMs = Math.Clamp(CommonDelayMs, 0, MaxDelayMs);
         foreach (var camera in Cameras)
+        {
             camera.DelayMs = Math.Clamp(camera.DelayMs, 0, MaxDelayMs);
+            camera.ScaleMode = ScaleModes.Normalize(camera.ScaleMode);
+            if (string.IsNullOrWhiteSpace(camera.CaptureFormat))
+                camera.CaptureFormat = "Auto";
+            if (camera.CaptureFps is int f && (f < 1 || f > 120))
+                camera.CaptureFps = null;
+            if (camera.CaptureWidth is not > 0 || camera.CaptureHeight is not > 0)
+            {
+                camera.CaptureWidth = null;
+                camera.CaptureHeight = null;
+            }
+        }
 
         int count = Cameras.Count;
         if (Hotkeys == null)
@@ -121,11 +264,11 @@ public class AppConfig
         }
 
         ActiveIndex = Math.Clamp(ActiveIndex, 0, Math.Max(0, count - 1));
-
-        // The two virtual-camera switches are plain booleans with a "keep it
-        // stable" contract: Normalize never rewrites them, so a slot the user
-        // turned off stays off across saves, reloads and launches.
     }
+
+    /// <summary>Deep copy through JSON (keeps unknown fields).</summary>
+    public AppConfig Clone() =>
+        JsonSerializer.Deserialize<AppConfig>(JsonSerializer.Serialize(this))!;
 
     private static int ClampEven(int v, int def)
     {

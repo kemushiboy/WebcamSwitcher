@@ -57,19 +57,27 @@ internal sealed class InteropVirtualCameraNative : IVirtualCameraNative
 
 /// <summary>
 /// Manages the Windows 11 Media Foundation virtual cameras via the native shim
-/// in WebcamSwitcher.Source.dll (MFCreateVirtualCamera + Start/Stop), one slot at
-/// a time.
+/// in WebcamSwitcher.Source.dll (MFCreateVirtualCamera + Start/Stop).
 ///
-/// Slots are numbered over the whole configuration: <c>0..cameras.Count-1</c> are
-/// the passthrough cameras, <c>cameras.Count</c> is the switcher camera. Friendly
-/// names, pipes and the vcams.ini mapping are computed for every slot regardless
-/// of which are enabled, so a slot never renames itself or a neighbour because a
-/// different slot is off, and a slot can be started later without a restart.
+/// Every virtual camera is identified by a <b>key</b> - the persistent
+/// <see cref="CameraConfig.VirtualCameraId"/> of its Camera Role, or
+/// <see cref="SwitcherKey"/> for the switcher - never by its position. Its
+/// friendly name is the role's <see cref="CameraConfig.VirtualCameraName"/>
+/// (no automatic "(2)" suffixes: duplicates are refused instead) and its pipe
+/// is <see cref="Protocol.RolePipeName"/> of the key.
+///
+/// The index-based members (<see cref="StartSlot"/>, <see cref="SlotName"/>, ...)
+/// remain for the UI and tests: index i is camera i of the last
+/// <see cref="Prepare"/> call and index <c>cameras.Count</c> is the switcher.
+/// They are only a view; reordering the list never stops or renames anything.
 /// </summary>
 public sealed class VirtualCameraService : IDisposable
 {
     /// <summary>Friendly name of the switcher virtual camera (unchanged).</summary>
     public const string SwitcherName = "WebcamSwitcher Virtual Camera";
+
+    /// <summary>Key of the switcher slot.</summary>
+    public const string SwitcherKey = "switcher";
 
     private static readonly string DefaultVcamsIniPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -84,21 +92,28 @@ public sealed class VirtualCameraService : IDisposable
     private const string SourceClsidKey =
         @"Software\Classes\CLSID\" + Protocol.SourceClsid + @"\InprocServer32";
 
+    private sealed class Slot
+    {
+        public required string Key;
+        public required string Role;
+        public string Name = "";
+        public string Pipe = "";
+        public IntPtr Handle;
+        public bool Blocked;          // duplicate name/key: never started
+        public readonly object Gate = new();
+    }
+
     private readonly IVirtualCameraNative _native;
     private readonly string _vcamsIniPath;
 
     // Tests inject a fake native layer, which has no DLL/COM registration to check.
     private readonly bool _skipPreflight;
 
-    // Serialises Start/Stop per slot: one native create/stop can take ~1 s, and a
-    // second call for the same slot must wait rather than race. Different slots
-    // use different locks and proceed independently.
     private readonly object _slotsLock = new();
-    private readonly List<object> _slotLocks = new();
-
-    private readonly List<string> _names = new();
-    private readonly List<string> _pipes = new();
-    private readonly List<IntPtr> _handles = new();
+    private readonly Dictionary<string, Slot> _byKey = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _order = new(); // index view: cameras..., switcher
+    private readonly object _prepareLock = new();
+    private string? _lastFingerprint;
 
     public VirtualCameraService() : this(new InteropVirtualCameraNative(), null)
     {
@@ -115,7 +130,7 @@ public sealed class VirtualCameraService : IDisposable
     /// <summary>Number of slots: one per camera plus the switcher.</summary>
     public int SlotCount
     {
-        get { lock (_slotsLock) return _names.Count; }
+        get { lock (_slotsLock) return _order.Count; }
     }
 
     /// <summary>True while at least one virtual camera handle is held.</summary>
@@ -124,77 +139,126 @@ public sealed class VirtualCameraService : IDisposable
         get
         {
             lock (_slotsLock)
-            {
-                foreach (var h in _handles)
-                    if (h != IntPtr.Zero)
-                        return true;
-                return false;
-            }
+                return _byKey.Values.Any(s => s.Handle != IntPtr.Zero);
         }
     }
 
     public string FriendlyName => SwitcherName;
 
-    /// <summary>Friendly name of a slot, or null when the slot does not exist.</summary>
-    public string? SlotName(int index)
+    private Slot? SlotAt(int index)
     {
         lock (_slotsLock)
-            return index >= 0 && index < _names.Count ? _names[index] : null;
+            return index >= 0 && index < _order.Count && _byKey.TryGetValue(_order[index], out var s) ? s : null;
     }
+
+    private Slot? SlotFor(string key)
+    {
+        lock (_slotsLock)
+            return _byKey.TryGetValue(key, out var s) ? s : null;
+    }
+
+    /// <summary>Friendly name of a slot, or null when the slot does not exist.</summary>
+    public string? SlotName(int index) => SlotAt(index)?.Name;
 
     /// <summary>True when that slot currently holds a live native handle.</summary>
-    public bool IsSlotRunning(int index)
-    {
-        lock (_slotsLock)
-            return index >= 0 && index < _handles.Count && _handles[index] != IntPtr.Zero;
-    }
+    public bool IsSlotRunning(int index) => SlotAt(index)?.Handle is { } h && h != IntPtr.Zero;
+
+    /// <summary>True when the virtual camera with this key is live.</summary>
+    public bool IsKeyRunning(string key) => SlotFor(key)?.Handle is { } h && h != IntPtr.Zero;
+
+    /// <summary>True when this key's slot is blocked as a duplicate.</summary>
+    public bool IsKeyBlocked(string key) => SlotFor(key)?.Blocked == true;
+
+    /// <summary>Pipe name of the virtual camera with this key, or null.</summary>
+    public string? PipeFor(string key) => SlotFor(key)?.Pipe;
 
     /// <summary>Test hook: the native handle held by a slot (IntPtr.Zero when stopped).</summary>
-    internal IntPtr SlotHandleForTest(int index)
-    {
-        lock (_slotsLock)
-            return index >= 0 && index < _handles.Count ? _handles[index] : IntPtr.Zero;
-    }
+    internal IntPtr SlotHandleForTest(int index) => SlotAt(index)?.Handle ?? IntPtr.Zero;
+
+    /// <summary>Key of a camera's virtual camera (its persistent ID).</summary>
+    public static string KeyOf(CameraConfig camera) => camera.VirtualCameraId;
 
     /// <summary>
-    /// Computes the deduped friendly names and pipes for every slot and writes
-    /// the routing file, without creating anything. Idempotent: the same camera
-    /// list always yields the same names. If the list changed while slots were
-    /// running, those slots are stopped first (they would no longer match).
+    /// Brings the slot table in line with the role list and writes the routing
+    /// file, without creating anything. Only slots whose role disappeared or
+    /// whose name changed are stopped (old name first: stop, unregister, then
+    /// the new name can be started); every other running slot is untouched.
+    /// Idempotent.
     /// </summary>
     public bool Prepare(IReadOnlyList<CameraConfig>? cameras)
     {
-        List<string> names;
-        List<string> pipes;
-        lock (_slotsLock)
+        cameras ??= Array.Empty<CameraConfig>();
+        var dupes = CameraRoles.DuplicatedRoles(cameras);
+
+        var desired = new List<(string Key, string Role, string Name, string Pipe, bool Blocked)>();
+        var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in cameras)
         {
-            names = BuildNames(cameras, out pipes);
-            if (SequenceEqual(names, _names))
+            string key = KeyOf(c);
+            bool blocked = dupes.Contains(c.Role) || string.IsNullOrWhiteSpace(key) ||
+                           !CameraRoles.IsValidVirtualCameraName(c.VirtualCameraName);
+            if (string.IsNullOrWhiteSpace(key) || !seenKeys.Add(key))
+                key = "invalid:" + c.Role + ":" + desired.Count; // never collides with a real slot
+            desired.Add((key, c.Role, c.VirtualCameraName ?? "", Protocol.RolePipeName(key), blocked));
+        }
+        desired.Add((SwitcherKey, "SWITCHER", SwitcherName, Protocol.PipeName, false));
+
+        // Called before every start/stop: an unchanged role list must cost
+        // nothing (no lock contention between roles, no file write).
+        string fingerprint = string.Join("\n", desired.Select(d => $"{d.Key}\t{d.Role}\t{d.Name}\t{d.Blocked}"));
+        lock (_prepareLock)
+        {
+            if (fingerprint == _lastFingerprint)
                 return true;
+            PrepareCore(desired);
+            _lastFingerprint = fingerprint;
+        }
+        return true;
+    }
+
+    private void PrepareCore(List<(string Key, string Role, string Name, string Pipe, bool Blocked)> desired)
+    {
+        var toStop = new List<Slot>();
+        lock (_slotsLock)
+        {
+            var wanted = desired.ToDictionary(d => d.Key, StringComparer.OrdinalIgnoreCase);
+            foreach (var slot in _byKey.Values.ToList())
+            {
+                bool gone = !wanted.TryGetValue(slot.Key, out var d);
+                bool renamed = !gone && (!string.Equals(d.Name, slot.Name, StringComparison.Ordinal) || d.Blocked);
+                if ((gone || renamed) && slot.Handle != IntPtr.Zero)
+                    toStop.Add(slot);
+                if (gone)
+                    _byKey.Remove(slot.Key);
+            }
         }
 
-        // Mapping changed: existing handles refer to the old names.
-        if (IsRunning)
+        // Stop outside the table lock: a native stop can take ~1 s.
+        foreach (var slot in toStop)
         {
-            AppLog.Write("VirtualCameraService: camera list changed while virtual cameras were running -> stopping all slots");
-            Stop();
+            AppLog.Write(slot.Role, $"virtual camera '{slot.Name}' is being renamed or removed -> stopping and unregistering it");
+            StopSlotCore(slot);
         }
 
         lock (_slotsLock)
         {
-            _names.Clear();
-            _names.AddRange(names);
-            _pipes.Clear();
-            _pipes.AddRange(pipes);
-            _handles.Clear();
-            for (int i = 0; i < names.Count; i++)
-                _handles.Add(IntPtr.Zero);
-            while (_slotLocks.Count < names.Count)
-                _slotLocks.Add(new object());
+            _order.Clear();
+            foreach (var d in desired)
+            {
+                if (!_byKey.TryGetValue(d.Key, out var slot))
+                {
+                    slot = new Slot { Key = d.Key, Role = d.Role };
+                    _byKey[d.Key] = slot;
+                }
+                slot.Role = d.Role;
+                slot.Name = d.Name;
+                slot.Pipe = d.Pipe;
+                slot.Blocked = d.Blocked;
+                _order.Add(d.Key);
+            }
         }
 
-        WriteVcamsIni(names, pipes);
-        return true;
+        WriteVcamsIni(desired.Where(d => !d.Blocked).Select(d => (d.Name, d.Pipe)).ToList());
     }
 
     /// <summary>
@@ -220,99 +284,106 @@ public sealed class VirtualCameraService : IDisposable
         return any;
     }
 
-    /// <summary>
-    /// Registers and starts one passthrough virtual camera per camera plus the
-    /// switcher virtual camera. Kept for callers that want every slot.
-    /// Returns whether the switcher virtual camera started.
-    /// </summary>
+    /// <summary>Starts every slot (all roles plus the switcher).</summary>
     public bool Start(IReadOnlyList<CameraConfig> cameras) => StartEnabled(cameras, _ => true);
 
-    /// <summary>
-    /// Creates and starts exactly one slot. Safe to call repeatedly: a running
-    /// slot is a no-op. Never throws.
-    /// </summary>
+    /// <summary>Creates and starts one slot by index. Idempotent; never throws.</summary>
     public bool StartSlot(int index)
     {
-        object gate;
-        string name;
-        lock (_slotsLock)
+        var slot = SlotAt(index);
+        if (slot == null)
         {
-            if (index < 0 || index >= _names.Count)
-            {
-                AppLog.Write($"VirtualCameraService.StartSlot({index}): no such slot");
-                return false;
-            }
-            gate = _slotLocks[index];
-            name = _names[index];
+            AppLog.Write($"VirtualCameraService.StartSlot({index}): no such slot");
+            return false;
         }
+        return StartSlotCore(slot);
+    }
 
-        lock (gate)
+    /// <summary>Creates and starts the virtual camera with this key. Idempotent; never throws.</summary>
+    public bool StartKey(string key)
+    {
+        var slot = SlotFor(key);
+        if (slot == null)
         {
-            lock (_slotsLock)
+            AppLog.Write($"VirtualCameraService.StartKey({key}): no such virtual camera (Prepare first)");
+            return false;
+        }
+        return StartSlotCore(slot);
+    }
+
+    private bool StartSlotCore(Slot slot)
+    {
+        lock (slot.Gate)
+        {
+            if (slot.Handle != IntPtr.Zero)
+                return true; // already running
+
+            if (slot.Blocked)
             {
-                if (_handles[index] != IntPtr.Zero)
-                    return true; // already running
+                AppLog.Write(slot.Role, $"DUPLICATED: virtual camera '{slot.Name}' not registered (duplicate role, name or ID)");
+                return false;
             }
 
             if (!_skipPreflight && !PreflightNativeSource())
                 return false;
 
-            int hr = _native.Start(name, Protocol.SourceClsid, out IntPtr handle);
+            int hr = _native.Start(slot.Name, Protocol.SourceClsid, out IntPtr handle);
             if (hr < 0 || handle == IntPtr.Zero)
             {
-                AppLog.Write($"VirtualCameraService.Start('{name}') slot {index} failed hr=0x{hr:X8}" +
-                             (handle == IntPtr.Zero && hr >= 0 ? " (null handle)" : string.Empty));
+                AppLog.Write(slot.Role, $"virtual camera '{slot.Name}' registration FAILED hr=0x{hr:X8}" +
+                                        (handle == IntPtr.Zero && hr >= 0 ? " (null handle)" : string.Empty));
                 return false;
             }
 
             lock (_slotsLock)
-                _handles[index] = handle;
+                slot.Handle = handle;
 
-            AppLog.Write($"VirtualCameraService.Start('{name}') slot {index} ok");
+            AppLog.Write(slot.Role, $"virtual camera '{slot.Name}' registered and started (pipe {slot.Pipe})");
             return true;
         }
     }
 
-    /// <summary>
-    /// Stops exactly one slot: shuts its virtual camera down so the device is no
-    /// longer enumerable and releases the handle. Other slots are untouched.
-    /// Safe to call repeatedly and on a slot that is not running. Never throws.
-    /// </summary>
+    /// <summary>Stops one slot by index. Other slots are untouched. Never throws.</summary>
     public bool StopSlot(int index)
     {
-        object gate;
-        string? name;
-        lock (_slotsLock)
+        var slot = SlotAt(index);
+        if (slot == null)
         {
-            if (index < 0 || index >= _names.Count)
-            {
-                AppLog.Write($"VirtualCameraService.StopSlot({index}): no such slot");
-                return false;
-            }
-            gate = _slotLocks[index];
-            name = _names[index];
+            AppLog.Write($"VirtualCameraService.StopSlot({index}): no such slot");
+            return false;
         }
+        return StopSlotCore(slot);
+    }
 
-        lock (gate)
+    /// <summary>Stops the virtual camera with this key. Never throws.</summary>
+    public bool StopKey(string key)
+    {
+        var slot = SlotFor(key);
+        return slot == null || StopSlotCore(slot);
+    }
+
+    private bool StopSlotCore(Slot slot)
+    {
+        lock (slot.Gate)
         {
             IntPtr handle;
             lock (_slotsLock)
             {
-                handle = _handles[index];
+                handle = slot.Handle;
                 if (handle == IntPtr.Zero)
                     return true; // already stopped
-                _handles[index] = IntPtr.Zero; // never hand this handle out twice
+                slot.Handle = IntPtr.Zero; // never hand this handle out twice
             }
 
             try
             {
                 _native.Stop(handle);
-                AppLog.Write($"VirtualCameraService.Stop('{name}') slot {index} ok");
+                AppLog.Write(slot.Role, $"virtual camera '{slot.Name}' stopped and unregistered");
                 return true;
             }
             catch (Exception ex)
             {
-                AppLog.Write($"VirtualCameraService.Stop('{name}') slot {index} threw {ex.GetType().Name}: {ex.Message}");
+                AppLog.Write(slot.Role, $"virtual camera '{slot.Name}' stop threw {ex.GetType().Name}: {ex.Message}");
                 return false;
             }
         }
@@ -321,9 +392,11 @@ public sealed class VirtualCameraService : IDisposable
     /// <summary>Stops every started virtual camera. Idempotent.</summary>
     public void Stop()
     {
-        int count = SlotCount;
-        for (int i = 0; i < count; i++)
-            StopSlot(i);
+        List<Slot> slots;
+        lock (_slotsLock)
+            slots = _byKey.Values.ToList();
+        foreach (var s in slots)
+            StopSlotCore(s);
     }
 
     public void Dispose() => Stop();
@@ -380,54 +453,7 @@ public sealed class VirtualCameraService : IDisposable
         return true;
     }
 
-    /// <summary>
-    /// Names for every slot, in slot order: each camera, then the switcher.
-    /// Dedupe is applied over the whole list, so the result depends only on the
-    /// camera list - never on which slots are enabled.
-    /// </summary>
-    private static List<string> BuildNames(IReadOnlyList<CameraConfig>? cameras, out List<string> pipes)
-    {
-        int count = cameras?.Count ?? 0;
-        var names = new List<string>(count + 1);
-        pipes = new List<string>(count + 1);
-        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        for (int i = 0; i < count; i++)
-        {
-            string baseName = $"{(cameras![i].FriendlyName ?? string.Empty)} (WebcamSwitcher)";
-            names.Add(Dedupe(baseName, used));
-            pipes.Add(Protocol.PassthroughPipeName(i));
-        }
-
-        names.Add(Dedupe(SwitcherName, used));
-        pipes.Add(Protocol.PipeName);
-        return names;
-    }
-
-    private static bool SequenceEqual(List<string> a, List<string> b)
-    {
-        if (a.Count != b.Count)
-            return false;
-        for (int i = 0; i < a.Count; i++)
-            if (!string.Equals(a[i], b[i], StringComparison.Ordinal))
-                return false;
-        return true;
-    }
-
-    private static string Dedupe(string baseName, HashSet<string> used)
-    {
-        if (used.Add(baseName))
-            return baseName;
-
-        for (int n = 2; ; n++)
-        {
-            string candidate = $"{baseName} ({n})";
-            if (used.Add(candidate))
-                return candidate;
-        }
-    }
-
-    private void WriteVcamsIni(IReadOnlyList<string> names, IReadOnlyList<string> pipes)
+    private void WriteVcamsIni(IReadOnlyList<(string Name, string Pipe)> map)
     {
         try
         {
@@ -437,11 +463,14 @@ public sealed class VirtualCameraService : IDisposable
 
             // UTF-8 without BOM, CRLF line endings.
             var sb = new StringBuilder();
-            for (int i = 0; i < names.Count; i++)
-                sb.Append(names[i]).Append('\t').Append(pipes[i]).Append("\r\n");
+            foreach (var (name, pipe) in map)
+                sb.Append(name).Append('\t').Append(pipe).Append("\r\n");
 
-            File.WriteAllText(_vcamsIniPath, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            AppLog.Write($"VirtualCameraService: wrote {names.Count} mapping(s) to {_vcamsIniPath}");
+            // Temp + move: the Frame Server may read this file at any moment.
+            string tmp = _vcamsIniPath + ".tmp";
+            File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.Move(tmp, _vcamsIniPath, overwrite: true);
+            AppLog.Write($"VirtualCameraService: wrote {map.Count} mapping(s) to {_vcamsIniPath}");
         }
         catch (Exception ex)
         {

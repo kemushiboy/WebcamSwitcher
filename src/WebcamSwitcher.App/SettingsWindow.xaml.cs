@@ -6,7 +6,6 @@ using MessageBox = System.Windows.MessageBox;
 using Panel = System.Windows.Controls.Panel;
 using ComboBox = System.Windows.Controls.ComboBox;
 using TextBox = System.Windows.Controls.TextBox;
-using Button = System.Windows.Controls.Button;
 using StackPanel = System.Windows.Controls.StackPanel;
 using Orientation = System.Windows.Controls.Orientation;
 using VerticalAlignment = System.Windows.VerticalAlignment;
@@ -21,18 +20,14 @@ public partial class SettingsWindow : Window
 {
     private readonly PipelineController _pipeline;
     private readonly List<CameraRow> _rows = new();
-    private List<CameraConfig> _devices = new();
 
     public SettingsWindow(PipelineController pipeline)
     {
         InitializeComponent();
         _pipeline = pipeline;
-        Loaded += async (_, _) => await InitializeAsync();
+        Loaded += (_, _) => Initialize();
 
-        // Delay boxes are live while typing, so anything not applied must be
-        // pushed back on the way out. Without this, Cancel (or the close button)
-        // would leave the running engine holding values that were never saved,
-        // and the next launch would silently differ from what the user saw.
+        // Delay boxes are live while typing; undo anything not applied.
         Closed += (_, _) =>
         {
             if (DialogResult != true)
@@ -40,23 +35,15 @@ public partial class SettingsWindow : Window
         };
     }
 
-    /// <summary>Restores the saved config's delays on the running engine.</summary>
     private void RevertLiveDelays()
     {
         var config = _pipeline.Config;
         _pipeline.ApplyDelaysLive(config.CommonDelayMs, config.Cameras.Select(c => c.DelayMs).ToList());
     }
 
-    private async Task InitializeAsync()
+    private void Initialize()
     {
-        _devices = await CameraEngine.EnumerateCamerasAsync();
-
         var config = _pipeline.Config;
-
-        // Ensure configured (possibly unplugged) devices still show in the dropdowns.
-        foreach (var cam in config.Cameras)
-            if (!_devices.Any(d => d.DeviceId == cam.DeviceId))
-                _devices.Add(cam);
 
         WidthCombo.ItemsSource = new[] { "3840", "1920", "1280", "960", "640" };
         WidthCombo.Text = config.Width.ToString();
@@ -65,146 +52,162 @@ public partial class SettingsWindow : Window
         FpsCombo.ItemsSource = new[] { "60", "30", "24", "15" };
         FpsCombo.Text = config.Fps.ToString();
 
+        RetryIntervalBox.Text = config.Reconnect.RetryIntervalMs.ToString();
+        RetryCountBox.Text = config.Reconnect.RetryCount.ToString();
+        RetryForeverBox.IsChecked = config.Reconnect.RetryForever;
+        StartupWaitBox.Text = config.Reconnect.StartupWaitMs.ToString();
+        NoSignalBox.Text = config.Reconnect.NoSignalTimeoutMs.ToString();
+
         RotateHotkeyBox.Text = config.RotateHotkey ?? "";
         CommonDelayBox.Text = config.CommonDelayMs.ToString();
         StartWithWindowsBox.IsChecked = config.StartWithWindows;
         StartMinimizedBox.IsChecked = config.StartMinimized;
-        VirtualCameraOnLaunchBox.IsChecked = config.VirtualCameraOnLaunch;
+        CaptureEnabledBox.IsChecked = config.CaptureEnabled;
+        AutoRegisterBox.IsChecked = config.AutoRegisterVirtualCameras;
+        RestartOnCrashBox.IsChecked = config.RestartOnCrash;
+        SwitcherBox.IsChecked = config.SwitcherVirtualCameraEnabled;
         PreferSmooth30FpsBox.IsChecked = config.PreferSmooth30Fps;
+        PerfIntervalBox.Text = config.PerformanceLogIntervalSeconds.ToString();
+        LogFilesBox.Text = config.LogMaxFiles.ToString();
+        LogSizeBox.Text = config.LogMaxFileMB.ToString();
 
         for (int i = 0; i < config.Cameras.Count; i++)
         {
-            var hotkey = config.Hotkeys is { Length: > 0 } && i < config.Hotkeys.Length ? config.Hotkeys[i] : "";
-            AddRow(config.Cameras[i], hotkey);
+            var hotkey = config.Hotkeys is { Length: > 0 } && i < config.Hotkeys.Length ? config.Hotkeys[i] ?? "" : "";
+            var row = new CameraRow(config.Cameras[i], hotkey, i);
+            row.DelayBox.TextChanged += (_, _) => ApplyDelaysLiveNow();
+            _rows.Add(row);
+            CamerasPanel.Children.Add(row.Panel);
         }
+        if (config.Cameras.Count == 0)
+            CamerasPanel.Children.Add(new TextBlock { Text = "No roles yet - use Camera registration.", Foreground = Brushes.Gray });
 
-        NoteText.Text = "Camera and format changes apply immediately. A consumer app may need to re-open the camera to pick up a new resolution. Delays also apply as you type; Apply saves them.";
-
-        // Wired last so the initial load above does not count as an edit.
+        NoteText.Text = "Changing a role's capture options restarts only that role. Changing the output format re-creates every virtual camera (consumers must re-open them). Startup options take effect at the next launch.";
         CommonDelayBox.TextChanged += (_, _) => ApplyDelaysLiveNow();
     }
 
-    /// <summary>
-    /// Applies the delay boxes to the running cameras at once, without saving and
-    /// without rebuilding the pipeline (a rebuild would disconnect every virtual
-    /// camera). Stays silent while a box is mid-edit or out of range: Apply reports
-    /// invalid input properly, and a half-typed number must not reach the engine.
-    /// </summary>
     private void ApplyDelaysLiveNow()
     {
-        if (!int.TryParse(CommonDelayBox.Text.Trim(), out int common) ||
-            common < 0 || common > AppConfig.MaxDelayMs)
+        if (!int.TryParse(CommonDelayBox.Text.Trim(), out int common) || common < 0 || common > AppConfig.MaxDelayMs)
             return;
-
         var delays = new List<int>(_rows.Count);
         foreach (var row in _rows)
         {
-            if (!int.TryParse(row.DelayBox.Text.Trim(), out int ms) ||
-                ms < 0 || ms > AppConfig.MaxDelayMs)
-                return;   // one invalid box: apply nothing rather than a mixed set
+            if (!int.TryParse(row.DelayBox.Text.Trim(), out int ms) || ms < 0 || ms > AppConfig.MaxDelayMs)
+                return;
             delays.Add(ms);
         }
-
         _pipeline.ApplyDelaysLive(common, delays);
     }
 
-    private void AddCamera_Click(object sender, RoutedEventArgs e) => AddRow(null, "");
-
-    private void AddRow(CameraConfig? cam, string hotkey)
+    private bool Warn(string text, string title)
     {
-        var row = new CameraRow(_devices, cam, hotkey, RemoveRow, _rows.Count);
-        _rows.Add(row);
-        // Delay is content only, so it is pushed into the running engine as soon as
-        // it is typed: the value can be tuned against a live picture without closing
-        // this dialog. Apply still persists it to config.json.
-        row.DelayBox.TextChanged += (_, _) => ApplyDelaysLiveNow();
-        CamerasPanel.Children.Add(row.Panel);
+        MessageBox.Show(this, text, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+        return false;
     }
 
-    private void RemoveRow(CameraRow row)
-    {
-        _rows.Remove(row);
-        CamerasPanel.Children.Remove(row.Panel);
-    }
+    private static bool Int(TextBox box, int min, int max, out int value) =>
+        int.TryParse(box.Text.Trim(), out value) && value >= min && value <= max;
 
     private async void Apply_Click(object sender, RoutedEventArgs e)
     {
         if (!int.TryParse(WidthCombo.Text, out int w) || !int.TryParse(HeightCombo.Text, out int h) || !int.TryParse(FpsCombo.Text, out int fps))
         {
-            MessageBox.Show(this, "Width, Height, and FPS must be numbers.", "Invalid output", MessageBoxButton.OK, MessageBoxImage.Warning);
+            Warn("Width, Height, and FPS must be numbers.", "Invalid output");
             return;
         }
-
-        if (!int.TryParse(CommonDelayBox.Text.Trim(), out int commonDelayMs) ||
-            commonDelayMs < 0 || commonDelayMs > AppConfig.MaxDelayMs)
+        if (!Int(CommonDelayBox, 0, AppConfig.MaxDelayMs, out int commonDelayMs))
         {
-            MessageBox.Show(this, $"Common video delay must be a number from 0 to {AppConfig.MaxDelayMs} ms.", "Invalid delay", MessageBoxButton.OK, MessageBoxImage.Warning);
+            Warn($"Common video delay must be 0-{AppConfig.MaxDelayMs} ms.", "Invalid delay");
+            return;
+        }
+        if (!Int(RetryIntervalBox, 250, 600_000, out int retryMs) || !Int(RetryCountBox, 0, 1_000_000, out int retryCount) ||
+            !Int(StartupWaitBox, 0, 600_000, out int startupMs) || !Int(NoSignalBox, 500, 60_000, out int noSignalMs))
+        {
+            Warn("Reconnect: interval 250-600000 ms, count 0-1000000, startup wait 0-600000 ms, no-signal 500-60000 ms.", "Invalid reconnect settings");
+            return;
+        }
+        if (!Int(PerfIntervalBox, 0, 3600, out int perf) || !Int(LogFilesBox, 1, 100, out int logFiles) || !Int(LogSizeBox, 1, 100, out int logMb))
+        {
+            Warn("Performance log interval 0-3600 s, log files 1-100, log size 1-100 MB.", "Invalid log settings");
             return;
         }
 
-        var next = new AppConfig { Width = w, Height = h, Fps = fps, CommonDelayMs = commonDelayMs };
+        var next = _pipeline.Config.Clone();
+        next.Width = w;
+        next.Height = h;
+        next.Fps = fps;
+        next.CommonDelayMs = commonDelayMs;
+        next.Reconnect.RetryIntervalMs = retryMs;
+        next.Reconnect.RetryCount = retryCount;
+        next.Reconnect.RetryForever = RetryForeverBox.IsChecked == true;
+        next.Reconnect.StartupWaitMs = startupMs;
+        next.Reconnect.NoSignalTimeoutMs = noSignalMs;
+        next.PerformanceLogIntervalSeconds = perf;
+        next.LogMaxFiles = logFiles;
+        next.LogMaxFileMB = logMb;
 
-        var cameras = new List<CameraConfig>();
         var hotkeys = new List<string>();
-        foreach (var row in _rows)
+        for (int i = 0; i < _rows.Count; i++)
         {
-            var sel = row.SelectedCamera;
-            if (sel == null || string.IsNullOrEmpty(sel.DeviceId))
+            var row = _rows[i];
+            var cam = next.Cameras.FirstOrDefault(c => c.VirtualCameraId == row.Key);
+            if (cam == null)
+                continue;
+            if (!string.IsNullOrWhiteSpace(row.HotkeyBox.Text) && Hotkey.Parse(row.HotkeyBox.Text) == null)
             {
-                MessageBox.Show(this, "Each camera must have a device selected.", "Invalid camera", MessageBoxButton.OK, MessageBoxImage.Warning);
+                Warn($"Invalid hotkey '{row.HotkeyBox.Text}' for {cam.Role}. Use e.g. 'Ctrl+Alt+1', or leave it empty.", "Invalid hotkey");
                 return;
             }
-            if (Hotkey.Parse(row.HotkeyBox.Text) == null)
+            if (!Int(row.DelayBox, 0, AppConfig.MaxDelayMs, out int delayMs))
             {
-                MessageBox.Show(this, $"Invalid hotkey '{row.HotkeyBox.Text}'. Use e.g. 'Ctrl+Alt+1'.", "Invalid hotkey", MessageBoxButton.OK, MessageBoxImage.Warning);
+                Warn($"Delay for {cam.Role} must be 0-{AppConfig.MaxDelayMs} ms.", "Invalid delay");
                 return;
             }
-            if (!int.TryParse(row.DelayBox.Text.Trim(), out int delayMs) ||
-                delayMs < 0 || delayMs > AppConfig.MaxDelayMs)
+            int? capFps = null;
+            if (!string.IsNullOrWhiteSpace(row.FpsBox.Text) && !row.FpsBox.Text.Trim().Equals("Auto", StringComparison.OrdinalIgnoreCase))
             {
-                MessageBox.Show(this, $"Delay for '{sel.FriendlyName}' must be a number from 0 to {AppConfig.MaxDelayMs} ms.", "Invalid delay", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
+                if (!Int(row.FpsBox, 1, 120, out int f))
+                {
+                    Warn($"Capture FPS for {cam.Role} must be Auto or 1-120.", "Invalid capture FPS");
+                    return;
+                }
+                capFps = f;
             }
             var (cw, ch) = row.SelectedCapture;
-            cameras.Add(new CameraConfig
-            {
-                DeviceId = sel.DeviceId,
-                FriendlyName = sel.FriendlyName,
-                CaptureWidth = cw,
-                CaptureHeight = ch,
-                CaptureFormat = row.SelectedFormat,
-                DelayMs = delayMs
-            });
-            hotkeys.Add(row.HotkeyBox.Text);
+            cam.CaptureWidth = cw;
+            cam.CaptureHeight = ch;
+            cam.CaptureFps = capFps;
+            cam.CaptureFormat = row.SelectedFormat;
+            cam.ScaleMode = ScaleModes.Normalize(row.ScaleCombo.Text);
+            cam.DelayMs = delayMs;
+            hotkeys.Add(row.HotkeyBox.Text.Trim());
         }
 
-        if (cameras.Count == 0)
+        if (!string.IsNullOrWhiteSpace(RotateHotkeyBox.Text) && Hotkey.Parse(RotateHotkeyBox.Text) == null)
         {
-            MessageBox.Show(this, "Add at least one camera.", "Invalid", MessageBoxButton.OK, MessageBoxImage.Warning);
+            Warn("Invalid rotate hotkey.", "Invalid hotkey");
             return;
         }
 
-        if (Hotkey.Parse(RotateHotkeyBox.Text) == null)
-        {
-            MessageBox.Show(this, "Invalid rotate hotkey.", "Invalid hotkey", MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
-
-        next.Cameras = cameras;
         next.Hotkeys = hotkeys.ToArray();
-        next.RotateHotkey = RotateHotkeyBox.Text;
-        next.ActiveIndex = Math.Clamp(_pipeline.ActiveIndex, 0, cameras.Count - 1);
+        next.RotateHotkey = RotateHotkeyBox.Text.Trim();
         next.StartWithWindows = StartWithWindowsBox.IsChecked == true;
         next.StartMinimized = StartMinimizedBox.IsChecked == true;
-        next.VirtualCameraOnLaunch = VirtualCameraOnLaunchBox.IsChecked == true;
+        next.CaptureEnabled = CaptureEnabledBox.IsChecked == true;
+        next.AutoRegisterVirtualCameras = AutoRegisterBox.IsChecked == true;
+        next.RestartOnCrash = RestartOnCrashBox.IsChecked == true;
+        next.SwitcherVirtualCameraEnabled = SwitcherBox.IsChecked == true;
         next.PreferSmooth30Fps = PreferSmooth30FpsBox.IsChecked == true;
-        // Not a settings control: carry the current runtime preview state through.
-        next.PreviewsEnabled = _pipeline.Config.PreviewsEnabled;
+        // CaptureEnabled is the persisted "auto-start capture" choice; the running
+        // capture state is changed with the main window's Cameras button.
+        bool captureWasRunning = _pipeline.CaptureActive;
 
         try
         {
             await _pipeline.ApplyAsync(next);
-            ConfigService.Save(next);
+            if (!captureWasRunning && next.CaptureEnabled)
+                AppLog.Write("Settings: capture auto-start enabled (takes effect at next launch or via the Cameras button)");
             DialogResult = true;
         }
         catch (Exception ex)
@@ -217,10 +220,12 @@ public partial class SettingsWindow : Window
 
     private sealed class CameraRow
     {
+        public string Key { get; }
         public Panel Panel { get; }
-        public ComboBox Combo { get; }
         public ComboBox CaptureCombo { get; }
+        public TextBox FpsBox { get; }
         public ComboBox FormatCombo { get; }
+        public ComboBox ScaleCombo { get; }
         public TextBox DelayBox { get; }
         public TextBox HotkeyBox { get; }
 
@@ -231,9 +236,6 @@ public partial class SettingsWindow : Window
 
         private static readonly string[] FormatOptions = { "Auto", "Nv12", "Mjpg" };
 
-        public CameraConfig? SelectedCamera => Combo.SelectedItem as CameraConfig;
-
-        /// <summary>Chosen capture size, or (null, null) for "Auto".</summary>
         public (int? W, int? H) SelectedCapture
         {
             get
@@ -249,7 +251,6 @@ public partial class SettingsWindow : Window
             }
         }
 
-        /// <summary>Chosen capture-format preference for this camera.</summary>
         public string SelectedFormat
         {
             get
@@ -263,108 +264,73 @@ public partial class SettingsWindow : Window
             }
         }
 
-        public CameraRow(List<CameraConfig> devices, CameraConfig? selected, string hotkey, Action<CameraRow> remove, int index)
+        private static TextBlock Label(string text) => new()
         {
-            Combo = new ComboBox
-            {
-                Width = 220,
-                ItemsSource = devices
-            };
-            // Explicit ItemTemplate so both the dropdown items AND the closed
-            // selection box render FriendlyName (DisplayMemberPath is not used by
-            // SelectionBoxItemTemplate in a custom ComboBox template).
-            if (System.Windows.Application.Current.FindResource("CameraItemTemplate") is System.Windows.DataTemplate template)
-                Combo.ItemTemplate = template;
-            System.Windows.Automation.AutomationProperties.SetAutomationId(Combo, "CameraCombo" + index);
-            if (selected != null)
-                Combo.SelectedItem = devices.FirstOrDefault(d => d.DeviceId == selected.DeviceId) ?? selected;
+            Text = text,
+            Foreground = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 4, 0)
+        };
 
-            HotkeyBox = new TextBox
+        public CameraRow(CameraConfig cam, string hotkey, int index)
+        {
+            Key = cam.VirtualCameraId;
+            var title = new TextBlock
             {
-                Width = 110,
-                Text = hotkey
+                Text = $"{cam.Role}",
+                Foreground = Brushes.White,
+                FontWeight = FontWeights.Bold,
+                Width = 64,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var device = new TextBlock
+            {
+                Text = cam.IsAssigned ? CameraRoles.DeviceIdTail(cam.DeviceId) : "(unassigned)",
+                Foreground = Brushes.Gray,
+                Width = 170,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                ToolTip = cam.DeviceId ?? ""
             };
 
             CaptureCombo = new ComboBox
             {
-                Width = 104,
+                Width = 96,
                 IsEditable = true,
                 ItemsSource = CaptureSizes,
-                Text = selected?.CaptureWidth is int sw && selected.CaptureHeight is int sh ? $"{sw}x{sh}" : "Auto",
-                ToolTip = "Capture resolution. Auto matches the output aspect (avoids black bars)."
+                Text = cam.CaptureWidth is int sw && cam.CaptureHeight is int sh ? $"{sw}x{sh}" : "Auto",
+                ToolTip = "Capture resolution. Auto: a mode reaching the output fps first, then the closest aspect and size."
             };
-
+            FpsBox = new TextBox { Width = 40, Text = cam.CaptureFps?.ToString() ?? "Auto", ToolTip = "Capture fps request (Auto = output fps)." };
             FormatCombo = new ComboBox
             {
-                Width = 84,
+                Width = 70,
                 IsEditable = true,
                 ItemsSource = FormatOptions,
-                Text = string.IsNullOrWhiteSpace(selected?.CaptureFormat) ? "Auto" : selected!.CaptureFormat,
-                ToolTip = "Capture format. Auto keeps NV12 when it runs at full rate and switches to MJPG when that is the only way to reach the output frame rate."
+                Text = string.IsNullOrWhiteSpace(cam.CaptureFormat) ? "Auto" : cam.CaptureFormat,
+                ToolTip = "Auto keeps uncompressed when it reaches the rate and never assumes MJPEG exists. Mjpg forces the compressed stream."
             };
-
-            DelayBox = new TextBox
-            {
-                Width = 52,
-                Text = Math.Clamp(selected?.DelayMs ?? 0, 0, AppConfig.MaxDelayMs).ToString(),
-                ToolTip = $"Extra video delay for this camera in milliseconds (0-{AppConfig.MaxDelayMs}). Added to the common delay so every camera this app exposes presents the same latency."
-            };
+            ScaleCombo = new ComboBox { Width = 86, ItemsSource = ScaleModes.All, Text = ScaleModes.Normalize(cam.ScaleMode), IsEditable = true, ToolTip = "How a different aspect (e.g. 640x480) is fitted into the output." };
+            DelayBox = new TextBox { Width = 46, Text = Math.Clamp(cam.DelayMs, 0, AppConfig.MaxDelayMs).ToString() };
+            HotkeyBox = new TextBox { Width = 90, Text = hotkey };
             System.Windows.Automation.AutomationProperties.SetAutomationId(DelayBox, "DelayBox" + index);
+            System.Windows.Automation.AutomationProperties.SetAutomationId(ScaleCombo, "ScaleCombo" + index);
 
-            var removeBtn = new Button
-            {
-                Content = "Remove",
-                Padding = new Thickness(8, 3, 8, 3),
-                Background = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)),
-                Foreground = Brushes.White
-            };
-            removeBtn.Click += (_, _) => remove(this);
-
-            var label = new TextBlock
-            {
-                Text = "Hotkey",
-                Foreground = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)),
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 6, 0)
-            };
-
-            var capLabel = new TextBlock
-            {
-                Text = "Capture",
-                Foreground = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)),
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 6, 0)
-            };
-
-            var fmtLabel = new TextBlock
-            {
-                Text = "Format",
-                Foreground = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)),
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 6, 0)
-            };
-
-            var delayLabel = new TextBlock
-            {
-                Text = "Delay (ms)",
-                Foreground = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)),
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 6, 0)
-            };
-
-            // WrapPanel so the extra controls flow onto a second line on narrow
-            // windows instead of being clipped by the fixed-width dialog.
             Panel = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
-            Panel.Children.Add(Combo);
-            Panel.Children.Add(capLabel);
+            Panel.Children.Add(title);
+            Panel.Children.Add(device);
+            Panel.Children.Add(Label("Capture"));
             Panel.Children.Add(CaptureCombo);
-            Panel.Children.Add(fmtLabel);
+            Panel.Children.Add(Label("fps"));
+            Panel.Children.Add(FpsBox);
+            Panel.Children.Add(Label("Format"));
             Panel.Children.Add(FormatCombo);
-            Panel.Children.Add(delayLabel);
+            Panel.Children.Add(Label("Fit"));
+            Panel.Children.Add(ScaleCombo);
+            Panel.Children.Add(Label("Delay"));
             Panel.Children.Add(DelayBox);
-            Panel.Children.Add(label);
+            Panel.Children.Add(Label("Hotkey"));
             Panel.Children.Add(HotkeyBox);
-            Panel.Children.Add(removeBtn);
         }
     }
 }

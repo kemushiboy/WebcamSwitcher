@@ -10,6 +10,12 @@ public static class Protocol
     /// <summary>Pipe for the continuous passthrough feed of camera slot <paramref name="slot"/>.</summary>
     public static string PassthroughPipeName(int slot) => PipeName + ".p" + slot;
 
+    /// <summary>
+    /// Pipe of one Camera Role, named after its persistent virtual camera ID so
+    /// that it is tied to the role, never to a list position.
+    /// </summary>
+    public static string RolePipeName(string virtualCameraId) => PipeName + ".r." + virtualCameraId;
+
     public const uint Magic = 0x57564353u;
     public const ushort Version = 1;
 
@@ -22,8 +28,8 @@ public static class Protocol
     public const uint FlagNone = 0;
     public const uint FlagNoSignal = 1;
 
-    public const int DefaultWidth = 1920;
-    public const int DefaultHeight = 1080;
+    public const int DefaultWidth = 1280;
+    public const int DefaultHeight = 720;
     public const int DefaultFps = 30;
 
     // CLSID of WebcamSwitcher.Source (matches dllmain.cpp)

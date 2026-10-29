@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
 using System.Windows.Forms;
@@ -58,6 +59,12 @@ public partial class App : Application
         }
 
         _config = ConfigService.Load();
+        AppLog.Configure(_config.LogMaxFiles, _config.LogMaxFileMB);
+        AppLog.Write("App", $"=== WebcamSwitcher {typeof(App).Assembly.GetName().Version} started (pid {Environment.ProcessId}, args '{string.Join(" ", e.Args)}', config '{ConfigService.Path}', log '{AppLog.CurrentPath}') ===");
+        HookUnhandledExceptions();
+        if (_config.RestartOnCrash)
+            RegisterForRestart();
+
         _pipeline = new PipelineController();
         _pipeline.SourcesChanged += OnSourcesChanged;
 
@@ -69,7 +76,10 @@ public partial class App : Application
         StartActivateListener();
         StartExitListener();
         CreateTray();
-        ShowMain();
+        if (_config.StartMinimized)
+            AppLog.Write("App", "starting minimized to the tray");
+        else
+            ShowMain();
 
         try
         {
@@ -78,6 +88,51 @@ public partial class App : Application
         catch (Exception ex)
         {
             AppLog.Write($"Startup: pipeline init failed: {ex}");
+        }
+
+        // First run: nothing is registered yet, and nothing is adopted
+        // automatically - open the registration screen instead.
+        if (_config.Cameras.Count == 0 && !_config.StartMinimized)
+        {
+            ShowMain();
+            new RegistrationWindow(_pipeline) { Owner = _mainWindow }.ShowDialog();
+        }
+    }
+
+    private static void HookUnhandledExceptions()
+    {
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            AppLog.Write("App", $"FATAL unhandled exception: {args.ExceptionObject}");
+            AppLog.Flush();
+        };
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            AppLog.Write("App", $"unobserved task exception: {args.Exception.GetBaseException().GetType().Name}: {args.Exception.GetBaseException().Message}");
+            args.SetObserved();
+        };
+        Current.DispatcherUnhandledException += (_, args) =>
+        {
+            AppLog.Write("App", $"UI thread exception: {args.Exception}");
+            AppLog.Flush();
+        };
+    }
+
+    // Windows Error Reporting relaunches a process that registered itself and
+    // crashed or hung after running for at least 60 s.
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern int RegisterApplicationRestart(string? commandLine, int flags);
+
+    private static void RegisterForRestart()
+    {
+        try
+        {
+            int hr = RegisterApplicationRestart("--restarted", 0);
+            AppLog.Write("App", hr == 0 ? "registered for automatic restart after a crash/hang" : $"RegisterApplicationRestart failed hr=0x{hr:X8}");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("App", $"RegisterApplicationRestart unavailable: {ex.Message}");
         }
     }
 
@@ -398,25 +453,8 @@ public partial class App : Application
 
     private async Task StartPipelineAsync()
     {
-        // Auto-populate cameras if none configured.
-        if (_config.Cameras.Count == 0)
-        {
-            try
-            {
-                var cams = await CameraEngine.EnumerateCamerasAsync();
-                var physical = cams.Where(c => !c.FriendlyName.Contains("WebcamSwitcher", StringComparison.OrdinalIgnoreCase)
-                                               && !c.FriendlyName.Contains("Windows Virtual Camera", StringComparison.OrdinalIgnoreCase)).ToList();
-                _config.Cameras = physical.Take(2).ToList();
-                if (_config.Hotkeys == null || _config.Hotkeys.Length == 0)
-                    _config.Hotkeys = new[] { "Ctrl+Alt+1", "Ctrl+Alt+2" };
-                _config.RotateHotkey ??= "Ctrl+Alt+N";
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"Enumeration failed: {ex}");
-            }
-        }
-
+        // No automatic adoption of "the first cameras found": roles are only
+        // ever bound to a device ID the user registered.
         await _pipeline!.StartAsync(_config);
     }
 
@@ -479,17 +517,18 @@ public partial class App : Application
         var menu = _tray.ContextMenuStrip;
         menu.Items.Clear();
 
-        var sources = _pipeline?.Sources ?? Array.Empty<CameraSource>();
-        _trayCameraItems = new ToolStripMenuItem[sources.Count];
-        for (int i = 0; i < sources.Count; i++)
+        var roles = _pipeline?.Config.Cameras ?? new List<CameraConfig>();
+        _trayCameraItems = new ToolStripMenuItem[roles.Count];
+        for (int i = 0; i < roles.Count; i++)
         {
             int idx = i;
-            var item = new ToolStripMenuItem(sources[i].DisplayName, null, (_, _) => { if (_pipeline != null) _pipeline.ActiveIndex = idx; });
+            var item = new ToolStripMenuItem($"{roles[i].Role} ({roles[i].VirtualCameraName})", null, (_, _) => { if (_pipeline != null) _pipeline.ActiveIndex = idx; });
             _trayCameraItems[i] = item;
             menu.Items.Add(item);
         }
 
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Camera registration", null, (_, _) => OpenRegistration());
         menu.Items.Add("Settings", null, (_, _) => OpenSettings());
         menu.Items.Add("Exit", null, (_, _) => Shutdown());
     }
@@ -500,6 +539,13 @@ public partial class App : Application
             return;
         for (int i = 0; i < _trayCameraItems.Length; i++)
             _trayCameraItems[i].Checked = _pipeline.ActiveIndex == i;
+    }
+
+    private void OpenRegistration()
+    {
+        ShowMain();
+        if (_pipeline != null)
+            new RegistrationWindow(_pipeline) { Owner = _mainWindow }.ShowDialog();
     }
 
     private void OpenSettings()
@@ -555,12 +601,13 @@ public partial class App : Application
         var work = Task.Run(async () =>
         {
             try { if (_pipeline != null) await _pipeline.DisposeAsync(); } catch { }
-            try { ConfigService.Save(_config); } catch { }
+            try { ConfigService.Save(_pipeline?.Config ?? _config); } catch { }
         });
 
         if (!work.Wait(budget))
             AppLog.Write($"Shutdown: teardown exceeded {budget.TotalSeconds:F0}s; continuing");
-        AppLog.Write("Shutdown: teardown end");
+        AppLog.Write("App", "=== WebcamSwitcher exited ===");
+        AppLog.Flush();
     }
 
     // Belt-and-braces: if WPF's shutdown path ever stalls (e.g. a background

@@ -91,12 +91,18 @@ if (-not $copied) {
 #    DllRegisterServer stores the DLL's ABSOLUTE path in HKLM, so this must run
 #    again whenever the repo moves. Needs an elevated shell; failure here is
 #    non-fatal - the app logs an actionable fix at startup.
+#    regsvr32 is a GUI program: PowerShell does not wait for it and
+#    $LASTEXITCODE would be stale, so wait explicitly and then verify the
+#    registration in HKLM instead of trusting the exit code.
 $sourceDll = Join-Path $appOut "WebcamSwitcher.Source.dll"
-& "$env:SystemRoot\System32\regsvr32.exe" /s $sourceDll
-if ($LASTEXITCODE -eq 0) {
+$reg = Start-Process -FilePath "$env:SystemRoot\System32\regsvr32.exe" -ArgumentList "/s", "`"$sourceDll`"" -Wait -PassThru -WindowStyle Hidden
+$clsidKey = "HKLM:\Software\Classes\CLSID\{7B1C4D2E-8F3A-4B5C-9D6E-1F2A3B4C5D6E}\InprocServer32"
+$registered = (Get-ItemProperty $clsidKey -ErrorAction SilentlyContinue).'(default)'
+if ($reg.ExitCode -eq 0 -and $registered -eq $sourceDll) {
     Write-Host "Registered media source: $sourceDll"
 } else {
-    Write-Warning "regsvr32 failed (exit $LASTEXITCODE) - run an elevated shell and: regsvr32 /s `"$sourceDll`""
+    Write-Warning "Media source NOT registered for this build (regsvr32 exit $($reg.ExitCode); HKLM points to '$registered'). From an elevated shell: regsvr32 /s `"$sourceDll`""
+    Write-Warning "The Frame Server runs as LOCAL SERVICE and cannot read DLLs under a user profile (e.g. Documents): install to C:\Program Files\WebcamSwitcher for real use."
 }
 
 Write-Host "Build complete. App: $appOut"

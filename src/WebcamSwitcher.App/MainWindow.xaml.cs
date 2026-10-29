@@ -15,6 +15,8 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<PreviewVm> _previews = new();
     private readonly object _renderLock = new();
     private readonly Dictionary<int, long> _lastRenderTicks = new();
+    private readonly System.Windows.Threading.DispatcherTimer _statusTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly List<(RoleChannel Channel, Action<byte[], int, int> Handler)> _previewHooks = new();
 
     // True while the global button is applying all slots at once. Chips are
     // locked during that time so the two controls cannot fight each other.
@@ -30,8 +32,14 @@ public partial class MainWindow : Window
         _pipeline.PreviewsStateChanged += OnStateChanged;
         _pipeline.VcamStateChanged += OnVcamStateChanged;
 
+        _pipeline.RoleStatusChanged += () => Dispatcher.BeginInvoke(RefreshRoleStatus);
+
         RebuildPreviews();
         UpdateToggles();
+
+        _statusTimer.Tick += (_, _) => RefreshRoleStatus();
+        _statusTimer.Start();
+        Closed += (_, _) => _statusTimer.Stop();
 
         // Minimised or hidden windows cannot show previews: stop converting them.
         // Frames keep flowing to the virtual cameras either way, and the first
@@ -181,23 +189,48 @@ public partial class MainWindow : Window
 
     private void OnSourcesChanged() => Dispatcher.BeginInvoke(RebuildPreviews);
 
+    /// <summary>
+    /// One tile per Camera Role, in configuration order, whether or not its
+    /// camera is connected (a missing camera must stay visible as MISSING).
+    /// Previews hook the role's channel, which survives reconnects.
+    /// </summary>
     private void RebuildPreviews()
     {
+        foreach (var (ch, h) in _previewHooks)
+            ch.PreviewReady -= h;
+        _previewHooks.Clear();
         _previews.Clear();
         lock (_renderLock)
             _lastRenderTicks.Clear();
 
-        var sources = _pipeline.Sources;
-        for (int i = 0; i < sources.Count; i++)
+        var channels = _pipeline.Channels.ToDictionary(c => c.Key, StringComparer.OrdinalIgnoreCase);
+        var roles = _pipeline.Config.Cameras;
+        for (int i = 0; i < roles.Count; i++)
         {
             int idx = i;
-            var vm = new PreviewVm(idx, sources[i].DisplayName);
-            sources[i].PreviewReady += (bgra, w, h) => OnPreview(idx, vm, bgra);
+            var role = roles[i];
+            var vm = new PreviewVm(idx, $"{role.Role}  ({role.VirtualCameraName})") { Key = role.VirtualCameraId };
+            if (channels.TryGetValue(role.VirtualCameraId, out var ch))
+            {
+                Action<byte[], int, int> handler = (bgra, w, h) => OnPreview(idx, vm, bgra);
+                ch.PreviewReady += handler;
+                _previewHooks.Add((ch, handler));
+            }
             _previews.Add(vm);
         }
 
         UpdateActive();
         RefreshVcamUi();
+        RefreshRoleStatus();
+    }
+
+    private void RefreshRoleStatus()
+    {
+        var snaps = _pipeline.Snapshot().ToDictionary(r => r.VirtualCameraId, StringComparer.OrdinalIgnoreCase);
+        foreach (var vm in _previews)
+            if (snaps.TryGetValue(vm.Key, out var r))
+                vm.ApplySnapshot(r);
+        UpdateStatus();
     }
 
     private void OnPreview(int idx, PreviewVm vm, byte[] bgra)
@@ -261,9 +294,13 @@ public partial class MainWindow : Window
     private void UpdateStatus()
     {
         var cfg = _pipeline.Config;
+        var snaps = _pipeline.Snapshot();
+        int connected = snaps.Count(r => r.CameraStatus == RoleStatus.Connected);
         var cam = _pipeline.CaptureActive
-            ? $"{_pipeline.Sources.Count} camera(s) · {cfg.Width}x{cfg.Height} @ {cfg.Fps}fps"
+            ? $"{connected}/{snaps.Count} role(s) connected · out {cfg.Width}x{cfg.Height} @ {cfg.Fps}fps NV12"
             : "capture stopped";
+        if (_pipeline.ProcessStats is { } p)
+            cam += $" · CPU {p.CpuPercent:0.0}% · mem {p.PrivateMB} MB";
 
         int passthrough = 0;
         for (int i = 0; i < _pipeline.CameraCount; i++)
@@ -276,6 +313,25 @@ public partial class MainWindow : Window
             : $"passthrough {passthrough}/{_pipeline.CameraCount} on";
 
         StatusText.Text = $"{cam} · {switcher} · {pass}";
+    }
+
+    private void Register_Click(object sender, RoutedEventArgs e)
+    {
+        new RegistrationWindow(_pipeline) { Owner = this }.ShowDialog();
+        RebuildPreviews();
+    }
+
+    private void OpenLog_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(AppLog.Directory);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(AppLog.Directory) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write($"OpenLog: {ex.Message}");
+        }
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e)

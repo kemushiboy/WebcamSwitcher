@@ -38,8 +38,8 @@ enum WsFrameFlags
 // Default (and currently fixed) output format, shared by the source (advertised
 // media type) and the app (normalized output). The pipe ConfigMsg carries the
 // same values so both sides agree without recompilation.
-#define WS_DEFAULT_WIDTH    1920
-#define WS_DEFAULT_HEIGHT   1080
+#define WS_DEFAULT_WIDTH    1280
+#define WS_DEFAULT_HEIGHT   720
 #define WS_DEFAULT_FPS_NUM  30
 #define WS_DEFAULT_FPS_DEN  1
 
