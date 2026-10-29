@@ -45,6 +45,7 @@ public partial class App : Application
         {
             AppLog.Write("Startup: --exit requested; signalling running instance");
             RequestExistingExit();
+            AppLog.Flush();
             Environment.Exit(0);
             return;
         }
@@ -53,7 +54,10 @@ public partial class App : Application
         {
             // ShutdownMode=OnExplicitShutdown would otherwise leave a windowless
             // message loop alive. Nothing is initialised on these paths, so exit
-            // hard (Shutdown() from OnStartup is not reliable).
+            // hard (Shutdown() from OnStartup is not reliable). The log is
+            // queued, so flush it first: otherwise "why did it close?" is lost.
+            AppLog.Write("App", $"this launch (pid {Environment.ProcessId}) exits: another WebcamSwitcher instance owns the cameras");
+            AppLog.Flush();
             Environment.Exit(0);
             return;
         }
@@ -619,6 +623,7 @@ public partial class App : Application
         {
             Thread.Sleep(4000);
             AppLog.Write("Shutdown watchdog: process still alive; forcing exit");
+            AppLog.Flush();
             Environment.Exit(0);
         }) { IsBackground = true, Name = "WebcamSwitcher.ShutdownWatchdog" };
         thread.Start();
