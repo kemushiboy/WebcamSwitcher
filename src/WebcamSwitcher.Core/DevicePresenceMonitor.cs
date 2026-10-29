@@ -60,6 +60,8 @@ public sealed class DevicePresenceMonitor : IDisposable
     {
         if (string.IsNullOrEmpty(deviceId))
             return false;
+        if (SyntheticSource.IsSynthetic(deviceId))
+            return true;
         lock (_lock)
             return _present.ContainsKey(deviceId);
     }

@@ -61,10 +61,15 @@ public sealed class DiagnosticFrame
             int scale = i == 0 ? Math.Max(2, _h / 60) : Math.Max(1, _h / 140);
             string text = lines[i] ?? "";
             int maxChars = Math.Max(1, (_w - 2 * (_w / 20)) / (6 * scale));
-            if (text.Length > maxChars)
-                text = text[..maxChars];
-            DrawText(text, _w / 20, y, scale, i == 0 ? (byte)235 : (byte)200);
-            y += (i == 0 ? 10 : 9) * scale + (i == 0 ? _h / 20 : _h / 60);
+            // Wrap rather than cut: the device ID tail is what tells two
+            // identical cameras apart, so it must stay readable.
+            for (int start = 0; start < Math.Max(1, text.Length) && y < _h - 8 * scale; start += maxChars)
+            {
+                string part = text.Length == 0 ? "" : text.Substring(start, Math.Min(maxChars, text.Length - start));
+                DrawText(part, _w / 20, y, scale, i == 0 ? (byte)235 : (byte)200);
+                y += (i == 0 ? 10 : 9) * scale;
+            }
+            y += i == 0 ? _h / 20 : _h / 60;
         }
         return _nv12;
     }

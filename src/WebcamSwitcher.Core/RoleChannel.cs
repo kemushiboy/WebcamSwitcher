@@ -283,19 +283,46 @@ public sealed class RoleChannel : IAsyncDisposable
             PublishDiagnostic(now);
             return;
         }
+        if (SyntheticSource.IsSynthetic(_cfg.DeviceId))
+        {
+            _synthetic ??= StartSynthetic();
+            _lastFrameUtc = _synthetic.LastFrameUtc;
+            SetStatus(RoleStatus.Connected, "SYNTHETIC TEST PATTERN (load testing only)");
+            return;
+        }
 
         var src = _source;
         if (src != null)
         {
-            bool gone = src.DeviceLost || (_presence.Ready && !_presence.IsPresent(_cfg.DeviceId));
-            if (gone)
+            bool removed = _presence.Ready && !_presence.IsPresent(_cfg.DeviceId);
+            if (removed || (src.DeviceLost && src.StreamFailure == CaptureFailure.DeviceNotFound))
             {
-                AppLog.Write(Role, $"physical camera DISCONNECTED ({(src.DeviceLost ? "capture failed" : "device removed")}); last frame {FormatTime(src.LastFrameUtc)}");
+                AppLog.Write(Role, $"physical camera DISCONNECTED (device removed); last frame {FormatTime(src.LastFrameUtc)}");
                 await DisposeSourceAsync().ConfigureAwait(false);
                 _failure = CaptureFailure.DeviceNotFound;
                 SetStatus(RoleStatus.Missing, "physical camera disconnected - waiting for the same device ID");
                 Volatile.Write(ref _nextAttemptTicks, now + _reconnect.RetryIntervalMs);
                 PublishDiagnostic(now);
+                return;
+            }
+            if (src.DeviceLost)
+            {
+                // Still enumerated, but Windows stopped the stream: not MISSING.
+                var kind = src.StreamFailure;
+                string detail = src.StreamFailureDetail;
+                AppLog.Write(Role, $"capture FAILED while streaming ({kind}): {detail}; last frame {FormatTime(src.LastFrameUtc)}");
+                await DisposeSourceAsync().ConfigureAwait(false);
+                _failure = kind;
+                if (kind == CaptureFailure.BandwidthSuspected)
+                    StepDownForBandwidth(detail);
+                SetStatus(RoleStatus.Error, kind switch
+                {
+                    CaptureFailure.BandwidthSuspected => $"USB BANDWIDTH INSUFFICIENT: {detail}",
+                    CaptureFailure.InUse => $"camera taken by another application: {detail}",
+                    _ => $"capture failed while streaming: {detail}",
+                });
+                Volatile.Write(ref _nextAttemptTicks, now + RetryDelayMs());
+                PublishDiagnostic(now, force: true);
                 return;
             }
 
@@ -329,7 +356,19 @@ public sealed class RoleChannel : IAsyncDisposable
             }
 
             _failure = CaptureFailure.None;
-            SetStatus(RoleStatus.Connected, src.PipelineDescription);
+            if (_pendingConnect)
+            {
+                // Counted only now that frames flow: an open that fails at once is no reconnect.
+                _pendingConnect = false;
+                if (_everConnected)
+                    Interlocked.Increment(ref _reconnects);
+                AppLog.Write(Role, _everConnected
+                    ? $"RECONNECTED (reconnect #{Interlocked.Read(ref _reconnects)}) after {_attempts} attempt(s)"
+                    : $"CONNECTED after {_attempts} attempt(s)");
+                _everConnected = true;
+                _attempts = 0;
+            }
+            SetStatus(RoleStatus.Connected, src.PipelineDescription + (_bandwidthStep > 0 ? $" [bandwidth fallback step {_bandwidthStep}]" : ""));
             CheckFrameRate(src, now);
             return;
         }
@@ -374,16 +413,18 @@ public sealed class RoleChannel : IAsyncDisposable
             PreferSmooth30Fps = _preferSmooth,
             CaptureFps = _fps,
             RequestedCaptureFps = _cfg.CaptureFps ?? 0,
-            PreferredFormat = string.IsNullOrWhiteSpace(_cfg.CaptureFormat) ? "Auto" : _cfg.CaptureFormat,
+            PreferredFormat = _formatOverride ?? (string.IsNullOrWhiteSpace(_cfg.CaptureFormat) ? "Auto" : _cfg.CaptureFormat),
             ScaleMode = _cfg.ScaleMode,
         };
         source.FrameReady += OnFrame;
         source.PreviewReady += OnPreview;
 
+        int capW = _sizeOverride?.W ?? _cfg.CaptureWidth ?? 0;
+        int capH = _sizeOverride?.H ?? _cfg.CaptureHeight ?? 0;
         bool ok;
         try
         {
-            ok = await source.StartAsync(_w, _h, _cfg.CaptureWidth ?? 0, _cfg.CaptureHeight ?? 0).ConfigureAwait(false);
+            ok = await source.StartAsync(_w, _h, capW, capH).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -401,20 +442,19 @@ public sealed class RoleChannel : IAsyncDisposable
         {
             _source = source;
             _sourceStartedTicks = Environment.TickCount64;
-            if (_everConnected)
-                Interlocked.Increment(ref _reconnects);
-            AppLog.Write(Role, $"physical camera OPENED (attempt {_attempts}{(_everConnected ? $", reconnect #{Interlocked.Read(ref _reconnects)}" : "")}): " +
+            _pendingConnect = true;
+            AppLog.Write(Role, $"physical camera OPENED (attempt {_attempts}): " +
                                $"input {source.InputWidth}x{source.InputHeight} {source.InputSubtype} @ {source.InputNominalFps:0.#} fps, " +
                                $"output {_w}x{_h} NV12 @ {_fps} fps, {source.PipelineDescription}");
-            _everConnected = true;
-            _attempts = 0;
             return;
         }
 
         _failure = source.LastFailure;
         string why = source.LastFailureDetail;
         await DisposeQuietly(source).ConfigureAwait(false);
-        Volatile.Write(ref _nextAttemptTicks, Environment.TickCount64 + _reconnect.RetryIntervalMs);
+        if (_failure == CaptureFailure.BandwidthSuspected)
+            StepDownForBandwidth(why);
+        Volatile.Write(ref _nextAttemptTicks, Environment.TickCount64 + RetryDelayMs());
 
         var (status, text) = _failure switch
         {
@@ -426,8 +466,48 @@ public sealed class RoleChannel : IAsyncDisposable
             _ => (RoleStatus.Error, $"camera could not be opened: {why}"),
         };
         SetStatus(status, text);
-        AppLog.Write(Role, $"open FAILED ({_failure}) attempt {_attempts}: {why}; next attempt in {_reconnect.RetryIntervalMs} ms");
+        AppLog.Write(Role, $"open FAILED ({_failure}) attempt {_attempts}: {why}; next attempt in {RetryDelayMs()} ms");
         PublishDiagnostic(Environment.TickCount64, force: true);
+    }
+
+    /// <summary>
+    /// The configured interval, except that a camera the USB bus still cannot
+    /// carry after every fallback step is retried at most every 15 s, so its
+    /// open/close attempts do not keep disturbing the cameras sharing the bus.
+    /// </summary>
+    private int RetryDelayMs() =>
+        _failure == CaptureFailure.BandwidthSuspected && _bandwidthStep >= 2
+            ? Math.Max(_reconnect.RetryIntervalMs, 15000)
+            : _reconnect.RetryIntervalMs;
+
+    private bool _pendingConnect;
+    private int _bandwidthStep;
+    private string? _formatOverride;
+    private (int W, int H)? _sizeOverride;
+
+    /// <summary>
+    /// After Windows reports the USB bus cannot carry this camera's stream, the
+    /// next attempts on the SAME device ask for less: first its compressed
+    /// (MJPEG) mode when the role is on Auto, then 640x480 (letterboxed). An
+    /// explicit Nv12/Mjpg choice is respected and only the size is reduced.
+    /// Lasts until the role is restarted; logged so it can be pinned in Settings.
+    /// </summary>
+    private void StepDownForBandwidth(string detail)
+    {
+        bool auto = string.IsNullOrWhiteSpace(_cfg.CaptureFormat) || _cfg.CaptureFormat.Equals("Auto", StringComparison.OrdinalIgnoreCase);
+        if (_bandwidthStep == 0 && auto)
+        {
+            _bandwidthStep = 1;
+            _formatOverride = "Mjpg";
+            AppLog.Write(Role, "bandwidth fallback step 1: next attempt uses the camera's MJPEG mode (if it has one)");
+        }
+        else if (_bandwidthStep <= 1)
+        {
+            _bandwidthStep = 2;
+            _formatOverride = auto ? "Auto" : _formatOverride;
+            _sizeOverride = (640, 480);
+            AppLog.Write(Role, "bandwidth fallback step 2: next attempt uses 640x480 (letterboxed into the output)");
+        }
     }
 
     /// <summary>
@@ -484,8 +564,8 @@ public sealed class RoleChannel : IAsyncDisposable
     private void OnFrame(byte[] nv12)
     {
         var src = _source;
-        if (LatencyProbeEnabled && src != null)
-            LatencyProbe.Stamp(nv12, _w, _h, src.LastArrivalTimestamp);
+        if (LatencyProbeEnabled)
+            LatencyProbe.Stamp(nv12, _w, _h, src?.LastArrivalTimestamp ?? Stopwatch.GetTimestamp());
 
         // Delay stage: while the ring is filling the newest frame goes out.
         if (_delay.TryPush(nv12, out byte[]? delayed) && delayed != null)
@@ -499,6 +579,17 @@ public sealed class RoleChannel : IAsyncDisposable
         }
         if (_mirror != null && _mirror.Wants(this))
             _mirror.Publish(this, nv12, info);
+    }
+
+    private SyntheticSource? _synthetic;
+
+    private SyntheticSource StartSynthetic()
+    {
+        var s = new SyntheticSource(_w, _h, _fps, _cfg.Role);
+        s.FrameReady += OnFrame;
+        s.Start();
+        AppLog.Write(Role, $"SYNTHETIC test pattern source started ({_w}x{_h}@{_fps}) - not a physical camera");
+        return s;
     }
 
     private void OnPreview(byte[] bgra, int w, int h)
@@ -562,7 +653,13 @@ public sealed class RoleChannel : IAsyncDisposable
             RoleStatus.FormatError => "FORMAT ERROR",
             RoleStatus.Connecting => "CONNECTING",
             RoleStatus.Reconnecting => "RECONNECTING",
-            _ => "CAMERA ERROR",
+            _ => _failure switch
+            {
+                CaptureFailure.BandwidthSuspected => "USB BANDWIDTH INSUFFICIENT",
+                CaptureFailure.InUse => "CAMERA IN USE BY ANOTHER APP",
+                CaptureFailure.OpenFailed => "CAMERA CANNOT BE OPENED",
+                _ => "CAMERA ERROR",
+            },
         };
         var lines = new List<string>
         {
@@ -581,12 +678,21 @@ public sealed class RoleChannel : IAsyncDisposable
     private static string FormatTime(DateTime utc) =>
         utc == DateTime.MinValue ? "NEVER" : utc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
 
+    private long _synthLastFrames;
+    private double _synthFps;
+
     private void UpdateOutputFps(long now)
     {
         long el = now - _outWindowStart;
         if (el < 2000)
             return;
         _outFps = Interlocked.Exchange(ref _outWindowSent, 0) * 1000.0 / el;
+        if (_synthetic != null)
+        {
+            long f = _synthetic.Frames;
+            _synthFps = (f - _synthLastFrames) * 1000.0 / el;
+            _synthLastFrames = f;
+        }
         _outWindowStart = now;
     }
 
@@ -611,16 +717,16 @@ public sealed class RoleChannel : IAsyncDisposable
             Detail = status == RoleStatus.VirtualCameraStopped ? "camera OK; this role's virtual camera is switched off" : _detail,
             Failure = _failure,
             Warning = _warning,
-            InputWidth = src?.InputWidth ?? 0,
-            InputHeight = src?.InputHeight ?? 0,
-            InputPixelFormat = src != null ? src.InputSubtype : "",
-            InputNominalFps = src?.InputNominalFps ?? 0,
-            InputFps = src?.MeasuredFps ?? 0,
+            InputWidth = src?.InputWidth ?? (_synthetic != null ? _w : 0),
+            InputHeight = src?.InputHeight ?? (_synthetic != null ? _h : 0),
+            InputPixelFormat = src != null ? src.InputSubtype : _synthetic != null ? "SYNTHETIC" : "",
+            InputNominalFps = src?.InputNominalFps ?? (_synthetic != null ? _fps : 0),
+            InputFps = src?.MeasuredFps ?? _synthFps,
             OutputWidth = _w,
             OutputHeight = _h,
             OutputFps = _fps,
             OutputFpsMeasured = _outFps,
-            FramesReceived = _framesBeforeSource + (src?.FramesLifetime ?? 0),
+            FramesReceived = _framesBeforeSource + (src?.FramesLifetime ?? 0) + (_synthetic?.Frames ?? 0),
             DroppedFrames = _droppedBeforeSource + (src?.DroppedFrames ?? 0) + _publisher.OverwrittenCount,
             LastFrameUtc = src?.LastFrameUtc is { } t && t != DateTime.MinValue ? t : _lastFrameUtc,
             Reconnects = Interlocked.Read(ref _reconnects),
@@ -678,6 +784,7 @@ public sealed class RoleChannel : IAsyncDisposable
             if (entered)
                 _gate.Release();
         }
+        _synthetic?.Dispose();
         _delay.Configure(0);
         _publisher.Dispose();
         AppLog.Write(Role, "role stopped");

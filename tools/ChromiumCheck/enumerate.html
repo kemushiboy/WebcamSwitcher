@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAM-xx Chromium check</title>
+<style>
+  :root { --bg: #ffffff; --fg: #1d1d1f; --muted: #666; --ok: #1b7f3b; --bad: #b3261e; --line: #ddd; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #161616; --fg: #eee; --muted: #aaa; --ok: #5fd27f; --bad: #ff8a80; --line: #333; } }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; margin: 16px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; vertical-align: top; }
+  code { font-size: 12px; word-break: break-all; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+  video { width: 320px; height: 180px; background: #000; margin: 4px; }
+</style>
+</head>
+<body>
+<h1>CAM-xx Chromium check</h1>
+<p class="muted">Lists every <code>videoinput</code> from <code>navigator.mediaDevices.enumerateDevices()</code>,
+then opens each device whose label starts with <code>CAM-</code> exactly the way the MediaPipe TouchDesigner
+plugin does (match by label, open by <code>deviceId: {exact}</code>, ideal 1280x720) and reports what it got.</p>
+<button id="run">Run check</button>
+<pre id="summary"></pre>
+<table id="devices"><thead><tr><th>#</th><th>label</th><th>deviceId</th><th>opened</th></tr></thead><tbody></tbody></table>
+<div id="videos"></div>
+<script>
+const out = document.getElementById('summary');
+const tbody = document.querySelector('#devices tbody');
+function log(s) { out.textContent += s + '\n'; }
+
+async function run() {
+  out.textContent = ''; tbody.innerHTML = ''; document.getElementById('videos').innerHTML = '';
+  // Labels are only exposed after a permission grant.
+  try { (await navigator.mediaDevices.getUserMedia({ video: true })).getTracks().forEach(t => t.stop()); }
+  catch (e) { log('permission/getUserMedia failed: ' + e.name + ' ' + e.message); }
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  log(`videoinput devices: ${devices.length}`);
+  const labels = devices.map(d => d.label);
+  const cams = devices.filter(d => d.label.startsWith('CAM-'));
+  log(`CAM-xx devices: ${cams.length} -> ${cams.map(d => d.label).join(' | ')}`);
+  const dupLabels = labels.filter((l, i) => labels.indexOf(l) !== i);
+  log(dupLabels.length ? `DUPLICATE LABELS: ${dupLabels.join(', ')}` : 'labels unique: yes');
+  const result = { devices: devices.map(d => ({ label: d.label, deviceId: d.deviceId })), opened: [] };
+
+  for (let i = 0; i < devices.length; i++) {
+    const d = devices[i];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i}</td><td>${d.label}</td><td><code>${d.deviceId}</code></td><td class="muted">-</td>`;
+    tbody.appendChild(tr);
+    if (!d.label.startsWith('CAM-')) continue;
+    // #auto&except=CAM-01,CAM-05 leaves those free for another consumer (latency probe).
+    const except = (new URLSearchParams(location.hash.slice(1)).get('except') || '').split(',').filter(Boolean);
+    if (except.some(x => d.label.startsWith(x + ' ') || d.label === x)) continue;
+    const cell = tr.lastChild;
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: d.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+      const v = document.createElement('video'); v.autoplay = true; v.muted = true; v.srcObject = s; v.title = d.label;
+      document.getElementById('videos').appendChild(v);
+      await new Promise(r => setTimeout(r, 1500));
+      const st = s.getVideoTracks()[0].getSettings();
+      const text = `${st.width}x${st.height} @ ${st.frameRate} fps`;
+      cell.textContent = text; cell.className = (st.width === 1280 && st.height === 720) ? 'ok' : 'bad';
+      result.opened.push({ label: d.label, width: st.width, height: st.height, frameRate: st.frameRate });
+      log(`${d.label}: opened ${text}`);
+    } catch (e) {
+      cell.textContent = e.name + ': ' + e.message; cell.className = 'bad';
+      result.opened.push({ label: d.label, error: e.name + ': ' + e.message });
+      log(`${d.label}: FAILED ${e.name} ${e.message}`);
+    }
+  }
+  window.__result = result;
+  log('done');
+}
+document.getElementById('run').onclick = run;
+if (location.hash === '#auto') run();
+</script>
+</body>
+</html>

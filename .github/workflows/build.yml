@@ -54,6 +54,10 @@ jobs:
         shell: powershell
         run: dotnet build src\WebcamSwitcher.Core\WebcamSwitcher.Core.csproj -c Release
 
+      - name: Camera Role tests (headless)
+        shell: powershell
+        run: dotnet run --project tools\RoleTest\RoleTest.csproj -c Release
+
       - name: Publish app (self-contained)
         shell: powershell
         run: |

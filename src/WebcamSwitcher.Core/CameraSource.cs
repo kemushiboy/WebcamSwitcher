@@ -282,7 +282,7 @@ public sealed class CameraSource : IAsyncDisposable
     /// watchdog recovery re-enters here after tearing the old capture down.
     /// </summary>
     private async Task<bool> StartCoreAsync(int outWidth, int outHeight, int captureWidth, int captureHeight,
-        IReadOnlyList<MediaFrameSourceGroup>? groups)
+        IReadOnlyList<MediaFrameSourceGroup>? groups, bool forceRaw = false)
     {
         OutputWidth = outWidth;
         OutputHeight = outHeight;
@@ -376,9 +376,31 @@ public sealed class CameraSource : IAsyncDisposable
         // example, defaults to 640x480 (4:3); scaling that into a 16:9 output
         // pillarboxes it. Selecting a native 16:9 mode fills the frame and lets
         // the Frame Server skip the resize entirely.
-        if (!await TrySetCaptureFormatAsync(colorSource, captureWidth, captureHeight))
+        if (!await TrySetCaptureFormatAsync(colorSource, captureWidth, captureHeight, forceUncompressed: forceRaw))
             return false;
         ComputeGeometryFrom(colorSource);
+
+        // Auto picked the camera's compressed mode (USB bandwidth). The WinRT
+        // reader cannot decode MJPEG to NV12, so hand the device to the Media
+        // Foundation decoder when the mode is already the output size; if that
+        // fails, or the size differs, reopen uncompressed. Never left black.
+        if (IsCompressed(_chosenSubtype) && !forceRaw)
+        {
+            if (InputWidth == outWidth && InputHeight == outHeight)
+            {
+                AppLog.Write($"Source({DisplayName}): {_chosenSubtype} {InputWidth}x{InputHeight} -> Media Foundation decoder");
+                await ReleaseCaptureAsync();
+                if (await TryStartMfMjpegAsync())
+                    return true;
+                AppLog.Write($"Source({DisplayName}): MF decode of {_chosenSubtype} failed; reopening uncompressed");
+            }
+            else
+            {
+                AppLog.Write($"Source({DisplayName}): {_chosenSubtype} at {InputWidth}x{InputHeight} != output; reopening uncompressed");
+                await ReleaseCaptureAsync();
+            }
+            return await StartCoreAsync(outWidth, outHeight, captureWidth, captureHeight, null, forceRaw: true);
+        }
 
         AppLog.Write($"Source.StartAsync({DisplayName}): CreateFrameReaderAsync");
         _reader = await StartReaderAsync(colorSource);
@@ -695,8 +717,26 @@ public sealed class CameraSource : IAsyncDisposable
                             ? rawBest
                             : overall;
 
-            var rates = string.Join(", ", candidates.Select(c => $"{c.Format.Subtype}@{c.Fps:0.#}"));
-            AppLog.Write($"Source({DisplayName}): {size.W}x{size.H} rates [{rates}] -> {chosen.Format.Subtype}@{chosen.Fps:0.#} (prefer {prefer})");
+            // Auto and USB bandwidth: an uncompressed 1280x720@30 stream needs
+            // ~440 Mbps - a whole USB 2.0 bus - so two such cameras cannot share
+            // one, and Windows fails the second with "insufficient bandwidth".
+            // When the raw mode is that heavy AND the camera offers a compressed
+            // mode at the same size and rate, Auto takes the compressed one (it
+            // costs a decode). A camera without MJPEG keeps its raw mode.
+            string why = "";
+            if (prefer.Equals("Auto", StringComparison.OrdinalIgnoreCase) && !chosen.Compressed)
+            {
+                double mbps = RawMbps(size.W, size.H, chosen.Format.Subtype, chosen.Fps);
+                var compressedSame = candidates.FirstOrDefault(c => c.Compressed && c.Fps >= chosen.Fps * 0.95);
+                if (mbps > AutoRawBandwidthLimitMbps && compressedSame != null)
+                {
+                    why = $" (raw would need {mbps:0} Mbps > {AutoRawBandwidthLimitMbps} Mbps USB budget; using the camera's {compressedSame.Format.Subtype})";
+                    chosen = compressedSame;
+                }
+            }
+
+            var rates = string.Join(", ", candidates.Select(c => $"{c.Format.Subtype}@{c.Fps:0.#}").Distinct());
+            AppLog.Write($"Source({DisplayName}): {size.W}x{size.H} rates [{rates}] -> {chosen.Format.Subtype}@{chosen.Fps:0.#} (prefer {prefer}){why}");
 
             _chosenSubtype = chosen.Format.Subtype ?? "NV12";
             InputNominalFps = chosen.Fps;
@@ -725,6 +765,19 @@ public sealed class CameraSource : IAsyncDisposable
             AppLog.Write($"Source({DisplayName}): SetFormat failed ({ex.Message}); keeping the device's current format");
             return true;
         }
+    }
+
+    /// <summary>
+    /// Above this an uncompressed mode is considered too heavy to share a USB 2.0
+    /// bus when the camera also offers a compressed mode (640x480@30 YUY2 = 147
+    /// Mbps stays raw; 1280x720@30 YUY2 = 442 Mbps does not).
+    /// </summary>
+    public const int AutoRawBandwidthLimitMbps = 160;
+
+    private static double RawMbps(uint w, uint h, string? subtype, double fps)
+    {
+        double bytesPerPixel = string.Equals(subtype, "NV12", StringComparison.OrdinalIgnoreCase) ? 1.5 : 2.0;
+        return w * (double)h * bytesPerPixel * fps * 8 / 1_000_000;
     }
 
     private static double FpsOf(MediaFrameFormat f)
@@ -825,6 +878,18 @@ public sealed class CameraSource : IAsyncDisposable
         }
     }
 
+    /// <summary>Closes MediaCapture so another reader (MF) can open the device.</summary>
+    private async Task ReleaseCaptureAsync()
+    {
+        var cap = _capture;
+        _capture = null;
+        if (cap == null)
+            return;
+        try { cap.Failed -= OnCaptureFailed; } catch { }
+        try { cap.Dispose(); } catch { }
+        await Task.Delay(RecoverySettleMs);
+    }
+
     private void Fail(CaptureFailure failure, string detail)
     {
         LastFailure = failure;
@@ -850,6 +915,7 @@ public sealed class CameraSource : IAsyncDisposable
             case 0x80070015: // ERROR_NOT_READY
                 Fail(CaptureFailure.DeviceNotFound, $"device removed or not ready: {detail}");
                 break;
+            case 0x800718CF: // "The camera interface does not have enough bandwidth" (USB)
             case 0xC00D3704: // MF_E_HW_MFT_FAILED_START_STREAMING: lack of hardware resources
             case 0x8007001F: // ERROR_GEN_FAILURE from the camera driver on stream start
             case 0x800705AA: // ERROR_NO_SYSTEM_RESOURCES
@@ -866,9 +932,26 @@ public sealed class CameraSource : IAsyncDisposable
 
     private void OnCaptureFailed(MediaCapture sender, MediaCaptureFailedEventArgs args)
     {
+        uint code = args.Code;
+        string msg = args.Message?.Trim() ?? "";
+        // Classified here so the supervisor can tell "unplugged" from "cannot
+        // stream" (bandwidth, preemption, driver) instead of one "lost".
+        StreamFailure = code switch
+        {
+            0x800718CF => CaptureFailure.BandwidthSuspected, // "camera interface does not have enough bandwidth"
+            0xC00D3704 or 0x800705AA or 0x8007001F => CaptureFailure.BandwidthSuspected,
+            0xC00DABE1 => CaptureFailure.InUse,
+            0xC00DABE0 or 0x8007048F or 0x80070490 => CaptureFailure.DeviceNotFound,
+            _ => CaptureFailure.OpenFailed,
+        };
+        StreamFailureDetail = $"0x{code:X8} {msg}";
         _deviceLost = true;
-        AppLog.Write($"Source({DisplayName}): MediaCapture.Failed 0x{args.Code:X8} {args.Message?.Trim()} -> treating the device as lost");
+        AppLog.Write($"Source({DisplayName}): MediaCapture.Failed 0x{code:X8} {msg} -> {StreamFailure}");
     }
+
+    /// <summary>Kind of the failure reported while streaming (valid when <see cref="DeviceLost"/>).</summary>
+    public CaptureFailure StreamFailure { get; private set; }
+    public string StreamFailureDetail { get; private set; } = "";
 
     // --- Geometry ---------------------------------------------------------------
 

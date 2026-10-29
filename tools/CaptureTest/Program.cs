@@ -21,9 +21,20 @@ using Windows.Media.MediaProperties;
 
 if (args.Length >= 2 && args[0] == "consume")
 {
-    var r = await Consume(args[1], 3, false, () => "n/a");
+    int si = Array.IndexOf(args, "--save");
+    SavePath = si >= 0 && si + 1 < args.Length ? Path.GetFullPath(args[si + 1]) : null;
+    Shared = args.Contains("--shared");
+    var r = await Consume(args[1], 3, args.Contains("--latency"), () => "n/a");
+    if (r != null && r.Value.lat.Length > 0) Console.WriteLine(r.Value.lat);
     Console.WriteLine($"CONSUME '{args[1]}' -> {(r == null ? "NO FRAME" : $"{r.Value.w}x{r.Value.h} {r.Value.fmt} {r.Value.fps:0.0} fps")}");
     return r != null ? 0 : 1;
+}
+
+if (args.Contains("--list"))
+{
+    foreach (var d in await DeviceInformation.FindAllAsync(DeviceClass.VideoCapture))
+        Console.WriteLine($"{(DevicePresenceMonitor.LooksVirtual(d.Id, d.Name) ? "virtual " : "physical")}\t{d.Name}\t{d.Id}");
+    return 0;
 }
 
 int seconds = 10;
@@ -79,7 +90,14 @@ foreach (var role in config.Cameras)
         $"own={mine.Publisher.ClientCount} others={channels.Where(c => c != mine).Sum(c => c.Publisher.ClientCount)}");
     if (res == null) { Console.WriteLine($"ROLE {role.Role}: FAIL (no frame)"); failures++; continue; }
     var (w, h, fmt, frames, fps, routing, lat) = res.Value;
-    bool routed = routing.StartsWith("own=1 ") && routing.EndsWith("others=0");
+    // The Frame Server may keep a previously opened role's pipe connected for a
+    // while, so "others" can be non-zero; what must hold is that this role's own
+    // pipe gained the client. With --latency the content proves the routing too:
+    // an assigned role carries capture stamps, an unassigned one (diagnostic
+    // picture) must not.
+    bool routed = !routing.StartsWith("own=0");
+    if (latency)
+        routed &= role.IsAssigned ? lat.Contains("latency ms") : lat.Contains("no stamped frames");
     bool ok = w == 1280 && h == 720 && routed && frames > 0;
     if (!ok) failures++;
     Console.WriteLine($"ROLE {role.Role}: {(ok ? "OK" : "FAIL")} {w}x{h} {fmt} frames={frames} fps={fps:0.0} routing[{routing}]{lat}");
@@ -113,7 +131,7 @@ static async Task<(int w, int h, string fmt, int frames, double fps, string rout
         await capture.InitializeAsync(new MediaCaptureInitializationSettings
         {
             SourceGroup = group,
-            SharingMode = MediaCaptureSharingMode.ExclusiveControl,
+            SharingMode = Shared ? MediaCaptureSharingMode.SharedReadOnly : MediaCaptureSharingMode.ExclusiveControl,
             StreamingCaptureMode = StreamingCaptureMode.Video,
             MemoryPreference = MediaCaptureMemoryPreference.Cpu
         });
@@ -129,7 +147,8 @@ static async Task<(int w, int h, string fmt, int frames, double fps, string rout
             using var f = s.TryAcquireLatestFrame();
             using var sw = f?.VideoMediaFrame?.SoftwareBitmap;
             if (sw == null) return;
-            Interlocked.Increment(ref frames);
+            if (Interlocked.Increment(ref frames) == 45 && SavePath != null)
+                SaveFrame(sw, SavePath);
             w = sw.PixelWidth; h = sw.PixelHeight; fmt = sw.BitmapPixelFormat.ToString();
             if (!lat) return;
             double ms = ReadLatencyMs(sw, now);
@@ -164,6 +183,23 @@ static async Task<(int w, int h, string fmt, int frames, double fps, string rout
     finally { capture.Dispose(); }
 }
 
+static void SaveFrame(Windows.Graphics.Imaging.SoftwareBitmap sw, string path)
+{
+    try
+    {
+        using var bgra = Windows.Graphics.Imaging.SoftwareBitmap.Convert(sw, Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, Windows.Graphics.Imaging.BitmapAlphaMode.Ignore);
+        using var mem = new Windows.Storage.Streams.InMemoryRandomAccessStream();
+        var enc = Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(Windows.Graphics.Imaging.BitmapEncoder.PngEncoderId, mem).AsTask().Result;
+        enc.SetSoftwareBitmap(bgra);
+        enc.FlushAsync().AsTask().Wait();
+        using var s = System.IO.WindowsRuntimeStreamExtensions.AsStreamForRead(mem.GetInputStreamAt(0));
+        using var f = File.Create(path);
+        s.CopyTo(f);
+        Console.WriteLine($"  [consume] saved frame to {path}");
+    }
+    catch (Exception ex) { Console.WriteLine($"  [consume] save failed: {ex.Message}"); }
+}
+
 static unsafe double ReadLatencyMs(Windows.Graphics.Imaging.SoftwareBitmap sw, long now)
 {
     using var buf = sw.LockBuffer(Windows.Graphics.Imaging.BitmapBufferAccessMode.Read);
@@ -173,6 +209,12 @@ static unsafe double ReadLatencyMs(Windows.Graphics.Imaging.SoftwareBitmap sw, l
     var span = new ReadOnlySpan<byte>(data + plane.StartIndex, plane.Stride * LatencyProbe.CellHeight);
     long stamp = LatencyProbe.Read(span, plane.Stride);
     return (now - stamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+}
+
+static partial class Program
+{
+    internal static string? SavePath;
+    internal static bool Shared;
 }
 
 [System.Runtime.InteropServices.ComImport]

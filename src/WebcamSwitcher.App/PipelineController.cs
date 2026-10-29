@@ -269,6 +269,9 @@ public sealed class PipelineController : IAsyncDisposable
 
         SourceFormatFile.Write(_config.Width, _config.Height, _config.Fps);
         ApplyStartWithWindows(_config.StartWithWindows);
+        RoleChannel.LatencyProbeEnabled = _config.LatencyProbe;
+        if (_config.LatencyProbe)
+            AppLog.Write("App", "LATENCY PROBE ENABLED (test mode): frames carry a timestamp barcode");
 
         _presence.Start();
         await _presence.WaitReadyAsync(3000);

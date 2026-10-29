@@ -211,6 +211,13 @@ public class AppConfig
 
     /// <summary>Rotated log files kept (each up to <see cref="LogMaxFileMB"/>).</summary>
     public int LogMaxFiles { get; set; } = 10;
+
+    /// <summary>
+    /// TEST ONLY: stamps each frame's capture time as a barcode in the top 16
+    /// rows so tools/CaptureTest can measure added latency. Visible in the
+    /// picture - never enable in production.
+    /// </summary>
+    public bool LatencyProbe { get; set; }
     public int LogMaxFileMB { get; set; } = 5;
 
     /// <summary>Unknown top-level properties, kept on save.</summary>
