@@ -16,6 +16,10 @@ using Windows.Devices.Enumeration;
 //                                          for tight, padded and bottom-up strides)
 // Defaults: 1280 720 30 3 (no filter)
 
+// Never write into the running app's rotated log: the visibility race test
+// alone logs ~150k lines in 300 ms and would rotate the real history away.
+AppLog.PathOverride = Path.Combine(Path.GetTempPath(), "WebcamSwitcher.MfProbe.log");
+
 var argList = args.ToList();
 bool legacy = argList.Remove("--legacy");
 bool copyTest = argList.Remove("--copytest");

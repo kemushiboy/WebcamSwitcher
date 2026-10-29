@@ -1,0 +1,70 @@
+{
+  "SchemaVersion": 2,
+  "Width": 1280,
+  "Height": 720,
+  "Fps": 30,
+  "Cameras": [
+    {
+      "Role": "CAM-01",
+      "VirtualCameraName": "CAM-01",
+      "VirtualCameraId": "0b7d2f0c6d3e4f1a9c8b7a6e5d4c3b21",
+      "DeviceId": "\\\\?\\USB#VID_056E&PID_701A&MI_00#6&d5ef2ca&1&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\GLOBAL",
+      "PhysicalFriendlyName": "ELECOM 2MP Webcam",
+      "CaptureWidth": null,
+      "CaptureHeight": null,
+      "CaptureFps": null,
+      "CaptureFormat": "Auto",
+      "ScaleMode": "Letterbox",
+      "VirtualCameraEnabled": true,
+      "DelayMs": 0
+    },
+    {
+      "Role": "CAM-02",
+      "VirtualCameraName": "CAM-02",
+      "VirtualCameraId": "5a1c9e7f2b8d4c6e8f0a1b2c3d4e5f60",
+      "DeviceId": "\\\\?\\USB#VID_056E&PID_701A&MI_00#7&1399ef30&1&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\GLOBAL",
+      "PhysicalFriendlyName": "ELECOM 2MP Webcam",
+      "CaptureWidth": null,
+      "CaptureHeight": null,
+      "CaptureFps": null,
+      "CaptureFormat": "Auto",
+      "ScaleMode": "Letterbox",
+      "VirtualCameraEnabled": true,
+      "DelayMs": 0
+    },
+    {
+      "Role": "CAM-03",
+      "VirtualCameraName": "CAM-03",
+      "VirtualCameraId": "9e8d7c6b5a4f4e3d2c1b0a9f8e7d6c5b",
+      "DeviceId": null,
+      "PhysicalFriendlyName": "",
+      "CaptureFormat": "Auto",
+      "ScaleMode": "Letterbox",
+      "VirtualCameraEnabled": true,
+      "DelayMs": 0
+    }
+  ],
+  "ActiveIndex": 0,
+  "Hotkeys": [ "", "", "" ],
+  "RotateHotkey": "",
+  "StartWithWindows": true,
+  "StartMinimized": true,
+  "SwitcherVirtualCameraEnabled": false,
+  "PreviewsEnabled": false,
+  "CaptureEnabled": true,
+  "AutoRegisterVirtualCameras": true,
+  "RestartOnCrash": true,
+  "PreferSmooth30Fps": false,
+  "CommonDelayMs": 0,
+  "Reconnect": {
+    "RetryIntervalMs": 2000,
+    "RetryCount": 30,
+    "RetryForever": true,
+    "StartupWaitMs": 15000,
+    "NoSignalTimeoutMs": 2000
+  },
+  "PerformanceLogIntervalSeconds": 60,
+  "LogMaxFiles": 10,
+  "LogMaxFileMB": 5,
+  "LatencyProbe": false
+}

@@ -12,7 +12,7 @@ internal static class VisibilitySelfTest
     public static int Run()
     {
         // No publishers and no switcher: nothing here starts a pipe or a thread.
-        var engine = new CameraEngine(Array.Empty<FramePublisher>(), null!);
+        var engine = new CameraEngine(null!, new DevicePresenceMonitor());
 
         bool ok = true;
         ok &= Expect("defaults: visible", engine.PreviewsVisible, true);

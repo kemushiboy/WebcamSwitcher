@@ -51,6 +51,8 @@ public sealed class FramePublisher : IDisposable
     private bool _needFirstFrame;
     private int _createErrorLogged;
     private long _publishCount;
+    private long _overwritten;
+    private long _sentCount;
     private long _startTicks;
     private int _disposed;
 
@@ -82,19 +84,21 @@ public sealed class FramePublisher : IDisposable
     /// <summary>Queues the latest NV12 frame for delivery to every connected client.</summary>
     public void PublishFrame(byte[] nv12, WsFrameInfo info)
     {
-        byte[] infoBytes = StructToBytes(info);
-        byte[] header = StructToBytes(new WsMsgHeader
+        int headerLen = Marshal.SizeOf<WsMsgHeader>();
+        int infoLen = Marshal.SizeOf<WsFrameInfo>();
+        var header = new WsMsgHeader
         {
             Magic = Protocol.Magic,
             Version = Protocol.Version,
             Type = Protocol.TypeFrame,
-            PayloadLen = (uint)(infoBytes.Length + nv12.Length)
-        });
-        int total = header.Length + infoBytes.Length + nv12.Length;
+            PayloadLen = (uint)(infoLen + nv12.Length)
+        };
+        int total = headerLen + infoLen + nv12.Length;
 
         // Assemble the message in a ring buffer that the writer does not hold.
         // The single full-frame copy here is the only one: the writer puts this
-        // very buffer on the pipe, so the old _pending -> _writeBuf copy is gone.
+        // very buffer on the pipe. Header and info are written in place, so a
+        // steady stream allocates nothing per frame.
         lock (_lock)
         {
             // A pending front has not been taken by the writer (it only takes one
@@ -102,6 +106,8 @@ public sealed class FramePublisher : IDisposable
             // wins" and it keeps the ring at three buffers.
             byte[]? pending = _front;
             _front = null;
+            if (pending != null)
+                _overwritten++;
 
             byte[] buf;
             if (pending != null && pending.Length == total)
@@ -120,9 +126,9 @@ public sealed class FramePublisher : IDisposable
                 buf = new byte[total];
             }
 
-            Buffer.BlockCopy(header, 0, buf, 0, header.Length);
-            Buffer.BlockCopy(infoBytes, 0, buf, header.Length, infoBytes.Length);
-            Buffer.BlockCopy(nv12, 0, buf, header.Length + infoBytes.Length, nv12.Length);
+            MemoryMarshal.Write(buf.AsSpan(0, headerLen), in header);
+            MemoryMarshal.Write(buf.AsSpan(headerLen, infoLen), in info);
+            Buffer.BlockCopy(nv12, 0, buf, headerLen + infoLen, nv12.Length);
 
             _front = buf;
             _frontLen = total;
@@ -130,6 +136,15 @@ public sealed class FramePublisher : IDisposable
         }
         Interlocked.Increment(ref _publishCount);
     }
+
+    /// <summary>
+    /// Frames replaced by a newer one before the writer could send them
+    /// ("latest wins" drops: the consumer side was slower than capture).
+    /// </summary>
+    public long OverwrittenCount { get { lock (_lock) return _overwritten; } }
+
+    /// <summary>Frames actually written to at least one client.</summary>
+    public long SentCount => Interlocked.Read(ref _sentCount);
 
     private void WriterLoop()
     {
@@ -181,6 +196,8 @@ public sealed class FramePublisher : IDisposable
                     if (!WriteAll(h, msg, 0, msgLen, out int error))
                         DropClient(h, WriteFailureReason(error));
                 }
+                if (clients.Length > 0 && !resend)
+                    Interlocked.Increment(ref _sentCount);
 
                 lock (_lock)
                 {

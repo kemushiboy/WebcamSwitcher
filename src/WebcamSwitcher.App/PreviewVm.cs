@@ -11,6 +11,52 @@ public sealed class PreviewVm : INotifyPropertyChanged
     public string Label { get; set; } = "";
     public WriteableBitmap Bitmap { get; }
 
+    /// <summary>Persistent ID of the role this tile shows (identity, not the index).</summary>
+    public string Key { get; init; } = "";
+
+    // ----- Role status (refreshed once a second from the pipeline snapshot) -----
+
+    private string _statusText = "";
+    private string _statusColor = "#8A8A8A";
+    private string _stats = "";
+    private string _detail = "";
+
+    public string StatusText => _statusText;
+    public string StatusColor => _statusColor;
+    public string Stats => _stats;
+    public string Detail => _detail;
+
+    public void ApplySnapshot(RoleSnapshot r)
+    {
+        string status = RoleStatusText.Label(r.Status);
+        string color = r.Status switch
+        {
+            RoleStatus.Connected => "#4CAF50",
+            RoleStatus.Connecting or RoleStatus.Reconnecting or RoleStatus.NoSignal => "#FFB300",
+            RoleStatus.VirtualCameraStopped or RoleStatus.Unassigned => "#8A8A8A",
+            _ => "#E05252",
+        };
+        string last = r.LastFrameUtc == DateTime.MinValue ? "never" : r.LastFrameUtc.ToLocalTime().ToString("HH:mm:ss");
+        string stats = r.CameraStatus == RoleStatus.Connected || r.InputWidth > 0
+            ? $"in {r.InputWidth}x{r.InputHeight} {r.InputPixelFormat} {r.InputFps:0.0}/{r.InputNominalFps:0.#}fps  ->  out {r.OutputWidth}x{r.OutputHeight} {r.OutputFpsMeasured:0.0}/{r.OutputFps}fps\n" +
+              $"recv {r.FramesReceived}  drop {r.DroppedFrames}  last {last}  proc {r.ProcessMicros / 1000.0:0.00}ms  reconn {r.Reconnects}"
+            : $"last frame {last}  reconn {r.Reconnects}";
+        string vcam = !r.VirtualCameraRunning ? "vcam off" : r.VirtualCameraInUse ? "vcam IN USE" : "vcam idle";
+        stats = $"{r.PhysicalFriendlyName}  {r.DeviceIdTail}\n{stats}\n{vcam}";
+        string detail = r.Warning.Length > 0 ? "! " + r.Warning : r.Detail;
+
+        if (status == _statusText && color == _statusColor && stats == _stats && detail == _detail)
+            return;
+        _statusText = status;
+        _statusColor = color;
+        _stats = stats;
+        _detail = detail;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StatusText)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StatusColor)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Stats)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Detail)));
+    }
+
     private bool _isActive;
     public bool IsActive
     {

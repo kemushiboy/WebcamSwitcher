@@ -10,14 +10,14 @@ public sealed class HotkeyService : IDisposable
 
     private HwndSource? _source;
     private AppConfig _config;
-    private readonly CameraEngine _engine;
+    private readonly PipelineController _engine;
     private readonly Dictionary<int, int> _idToCamera = new();
     private int _rotateId = -1;
     private int _nextId = 1;
 
     public event Action? Rotated;
 
-    public HotkeyService(AppConfig config, CameraEngine engine)
+    public HotkeyService(AppConfig config, PipelineController engine)
     {
         _config = config;
         _engine = engine;
@@ -79,7 +79,7 @@ public sealed class HotkeyService : IDisposable
 
     private void Rotate()
     {
-        int count = _engine.Sources.Count;
+        int count = _engine.CameraCount;
         if (count == 0)
             return;
         _engine.ActiveIndex = (_engine.ActiveIndex + 1) % count;

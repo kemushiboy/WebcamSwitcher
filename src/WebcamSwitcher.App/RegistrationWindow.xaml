@@ -1,0 +1,49 @@
+<Window x:Class="WebcamSwitcher.App.RegistrationWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Camera registration" Width="1100" Height="820"
+        WindowStartupLocation="CenterOwner" Background="#1E1E1E">
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,8">
+            <TextBlock Foreground="White" FontSize="16" FontWeight="Bold" Text="Camera registration"/>
+            <TextBlock Foreground="#AAA" TextWrapping="Wrap" Margin="0,4,0,0"
+                       Text="1. Check each connected camera's live picture.  2. Pick the Camera Role it should feed.  3. Save &amp; apply: the role's virtual camera is (re)registered. Cameras are identified only by Windows device ID, so identical models are told apart by the ID tail and the picture. A role whose device is not connected stays MISSING; it is never given another camera."/>
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <DockPanel Margin="0,4,0,6">
+                    <TextBlock Text="Physical cameras (currently connected)" Foreground="White" FontWeight="Bold" VerticalAlignment="Center"/>
+                    <Button x:Name="RefreshBtn" Content="Re-scan" Padding="10,3" Margin="12,0,0,0" HorizontalAlignment="Left"
+                            Background="#333" Foreground="White" Click="Refresh_Click" AutomationProperties.AutomationId="RescanButton"/>
+                </DockPanel>
+                <StackPanel x:Name="DevicesPanel"/>
+
+                <DockPanel Margin="0,16,0,6">
+                    <TextBlock Text="Camera Roles" Foreground="White" FontWeight="Bold" VerticalAlignment="Center"/>
+                    <Button Content="+ Add role" Padding="10,3" Margin="12,0,0,0" HorizontalAlignment="Left"
+                            Background="#333" Foreground="White" Click="AddRole_Click" AutomationProperties.AutomationId="AddRoleButton"/>
+                </DockPanel>
+                <TextBlock Foreground="#888" TextWrapping="Wrap" Margin="0,0,0,6"
+                           Text="Role and Virtual Camera Name must be unique. The Virtual Camera ID is permanent for a role and names its frame pipe. Renaming a role stops and unregisters its old virtual camera before the new name is registered; other roles are not touched."/>
+                <StackPanel x:Name="RolesPanel"/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <TextBlock x:Name="ErrorText" Grid.Row="2" Foreground="#FF8A80" TextWrapping="Wrap" Margin="0,8,0,0"/>
+
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button Content="Close" Padding="14,6" Margin="0,0,8,0" Background="#333" Foreground="White" Click="Close_Click"
+                    AutomationProperties.AutomationId="CloseButton"/>
+            <Button x:Name="SaveBtn" Content="Save &amp; apply" Padding="14,6" Background="#2D7DD2" Foreground="White" Click="Save_Click"
+                    AutomationProperties.AutomationId="SaveApplyButton"/>
+        </StackPanel>
+    </Grid>
+</Window>

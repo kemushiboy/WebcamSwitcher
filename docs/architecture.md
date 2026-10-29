@@ -1,6 +1,39 @@
 # Architecture
 
-## Overview
+## Camera Roles (current design)
+
+The sections further down describe the original two-camera design; the
+transport, the native media source and the Frame Server facts are unchanged.
+What changed is how cameras map to virtual cameras:
+
+```
+DevicePresenceMonitor (DeviceWatcher, by device ID)
+        │ present / removed
+        ▼
+CameraEngine ──▶ RoleChannel "CAM-01" ──▶ CameraSource (exact device ID only)
+             │        │  supervisor tick 500 ms: open / reconnect / classify failures
+             │        │  FrameDelayBuffer ─▶ FramePublisher  \\.\pipe\WebcamSwitcher.Frames.v1.r.<VirtualCameraId>
+             │        │  DiagnosticFrame when no live picture (MISSING, NO SIGNAL, ERROR …)
+             │        └─▶ (active role) switcher pipe \\.\pipe\WebcamSwitcher.Frames.v1
+             └─▶ RoleChannel "CAM-02" ...
+
+VirtualCameraService: key = VirtualCameraId; friendly name = VirtualCameraName;
+vcams.ini "<name>\t<pipe>" lets the native source (which only learns its
+friendly name from the Frame Server) find its role pipe.
+```
+
+- Identity is the role's persistent `VirtualCameraId`, never a list index.
+  `VirtualCameraService.Prepare` stops only slots whose role vanished or was
+  renamed; `CameraEngine.ApplyRolesAsync` rebuilds only roles whose capture
+  settings changed.
+- Windows derives the virtual camera's device instance
+  (`SWD#VCAMDEVAPI#<hash>`) from the registered name: re-registering the same
+  name yields the same device ID (observed across runs), so consumers keep it.
+- Failures are classified at the source (`CaptureFailure`): device not found,
+  open failed, in use, format failed, no frames, USB bandwidth (including
+  `MediaCapture.Failed` 0x800718CF while streaming).
+
+## Overview (original)
 
 WebcamSwitcher is a Windows 11 desktop application that composites two physical
 USB webcams into a single user-mode **Media Foundation virtual camera**, with

@@ -106,6 +106,9 @@ internal static class Program
         var cfg = new AppConfig { Width = 1280, Height = 720, Fps = 30 };
         for (int i = 0; i < cameras; i++)
             cfg.Cameras.Add(new CameraConfig { DeviceId = $"dev{i}", FriendlyName = i == 1 ? "C920" : $"Cam {i}" });
+        cfg.SchemaVersion = 1;
+        CameraRoles.Migrate(cfg); // schema-1 entries get roles CAM-01.. and persistent IDs
+        cfg.SwitcherVirtualCameraEnabled = true; // this harness exercises the switcher too
         cfg.Normalize();
         return cfg;
     }
@@ -257,7 +260,11 @@ internal static class Program
         long parallelMs = sw.ElapsedMilliseconds;
         ui.Pump();
         Check(native.PeakConcurrentTotal >= 2, $"different slots overlap natively (peak {native.PeakConcurrentTotal})");
-        Check(parallelMs < 40 * 2, $"two 40 ms slots ran in parallel: {parallelMs} ms (sequential would be >= 80)");
+        // Wall time now also includes two durable config saves (fsync + atomic
+        // replace, serialised by the store), so overlap is asserted on the native
+        // layer above and the time is only reported.
+        Console.WriteLine($"  (info) two 40 ms slots + 2 durable saves took {parallelMs} ms");
+        Check(native.MaxConcurrentForAnySingleSlot() == 1, "parallel start of different slots never doubled up one slot");
         Check(ctrl.IsVcamRunning(0) && ctrl.IsVcamRunning(2), "both parallel-started slots are running");
 
         // Switcher slot.
